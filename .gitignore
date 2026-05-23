@@ -1,0 +1,67 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE and system files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Secrets and local environment files
+.env
+.env.*
+*.key
+*.pem
+*.crt
+*.p12
+
+# Model weights and large ML artifacts
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.onnx
+*.tflite
+
+# Datasets and generated data snapshots
+data/raw/
+data/cleaned/
+data/sft/
+data/preference/
+data/eval/
+*.jsonl.gz
+*.parquet
+*.arrow
+
+# Training outputs and experiment logs
+outputs/
+checkpoints/
+runs/
+wandb/
+logs/
+tensorboard/
+
+# Embedding indexes and local caches
+*.faiss
+*.index
+.cache/
+cache/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
