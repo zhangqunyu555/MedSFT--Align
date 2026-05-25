@@ -71,11 +71,13 @@
 | --- | --- | --- |
 | 权重 | `pretrain_<hidden_size>.pth` | `full_sft_<hidden_size>.pth` |
 | 训练目标 | 文本续写 | 对话/指令跟随 |
-| loss/PPL | 待填 | 待填 |
-| 输出风格 | 待填 | 待填 |
-| 结论 | 待填 | 待填 |
+| loss/PPL | avg_loss=4.6624, PPL=105.8949 | avg_loss=2.6158, PPL=13.6782 |
+| 输出风格 | 更偏普通文本续写，不一定适应 user-assistant 问答格式 | 更能预测 assistant 回答内容，格式更像对话助手 |
+| 结论 | 在 SFT-style 验证集上 PPL 较高，说明未充分适配问答格式 | PPL 显著下降，说明 SFT 有效提升对话格式和 assistant 回答建模能力 |
 
-简历可表达结论：待填。
+验证集规模：10 examples / 685 valid tokens。该结果适合作为流程验证和初步对比，正式指标建议扩展到 100-500 条固定 eval 样本。
+
+简历可表达结论：在相同的 SFT 验证集上，Pretrain 模型的 PPL 为 105.89，而 Full SFT 模型的 PPL 降至 13.68，说明 SFT 显著提升了模型对指令问答格式的建模能力。Pretrain 阶段主要学习通用文本续写能力，对 user-assistant 对话格式不敏感；经过 SFT 后，模型能够更好地预测 assistant 回答内容，指令跟随和对话格式适配能力明显增强。
 
 ## 对比实验：Full SFT vs LoRA SFT
 

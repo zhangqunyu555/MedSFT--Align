@@ -6,7 +6,7 @@
 
 | 实验 | 对照组 | 实验组 | 核心结论 | 指标 |
 | --- | --- | --- | --- | --- |
-| Pretrain vs SFT | pretrain checkpoint | sft checkpoint | 预训练学习续写，SFT 学习对话格式和 assistant 响应 | PPL、对话格式正确率、生成样例 |
+| Pretrain vs SFT | pretrain checkpoint | full_sft checkpoint | 在相同 SFT 验证集上，Full SFT PPL 从 105.8949 降到 13.6782，说明 SFT 显著提升 user-assistant 对话格式和 assistant 回答建模能力 | avg_loss: 4.6624 -> 2.6158; PPL: 105.8949 -> 13.6782; eval=10 examples / 685 valid tokens |
 | RoPE ablation | 无 RoPE | 有 RoPE | 位置编码影响上下文顺序建模和长度泛化 | valid PPL、长文本 PPL、生成一致性 |
 | MHA vs GQA | MHA | GQA | GQA 降低 KV-Cache 显存，推理更省 | KV cache MB/token、tokens/sec、PPL |
 | LoRA rank | rank 8 | rank 16 / 32 | rank 越高容量越强但参数和显存增加 | 可训练参数量、PPL、SFT 样例评分 |
@@ -34,6 +34,21 @@
 | Reward Model | 规则评分 | learned RM | 学习式奖励可捕捉更复杂偏好，但有过拟合风险 | RM accuracy、偏好一致率 |
 | YaRN / 长上下文 | 原始 RoPE | RoPE scaling | 长上下文外推能改善长文本 PPL | long-context PPL、生成稳定性 |
 | Tool token SFT | 普通 SFT | tool-call SFT | 特殊 token 和模板让模型学会工具调用格式 | tool-call 格式正确率 |
+
+## 已完成实验结果
+
+### Pretrain vs Full SFT
+
+在相同的 SFT-style 验证集上，对 Pretrain 与 Full SFT 权重进行 PPL 评估：
+
+| 模型 | Avg Loss | PPL | 说明 |
+| --- | ---: | ---: | --- |
+| pretrain | 4.6624 | 105.8949 | 在 SFT 问答格式数据上预测较差，更偏通用文本续写能力 |
+| full_sft | 2.6158 | 13.6782 | 明显更适应 user-assistant 对话格式和 assistant 回答分布 |
+
+结论：Full SFT 在指令问答格式验证集上的 PPL 明显低于 Pretrain，说明 SFT 显著提升了模型对 user-assistant 对话格式的建模能力。Pretrain 阶段主要学习通用文本续写，对问答格式不敏感；经过 SFT 后，模型更能预测 assistant 回答内容，指令跟随和对话格式适配能力明显增强。
+
+注意：当前验证集规模为 10 examples / 685 valid tokens，适合作为流程验证和初步对比。正式实验指标建议扩展到 100-500 条固定 eval 样本，并确保 eval 集不参与训练。
 
 ## 记录模板
 
