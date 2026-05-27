@@ -48,6 +48,10 @@ data/eval/
 *.parquet
 *.arrow
 
+# External reference projects kept locally
+MedicalGPT/
+medical-gpt/
+
 # Training outputs and experiment logs
 outputs/
 checkpoints/
@@ -55,6 +59,9 @@ runs/
 wandb/
 logs/
 tensorboard/
+results/
+swanlog/
+.swanlab/
 
 # Embedding indexes and local caches
 *.faiss
@@ -64,4 +71,3 @@ cache/
 
 # Notebook checkpoints
 .ipynb_checkpoints/
-
