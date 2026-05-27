@@ -1,0 +1,20 @@
+# Default similarity filtering configuration for MedSFT-Align.
+
+input_path: data/cleaned/cleaned_alpaca.jsonl
+target_path: data/eval/ceval_medical_question_only.jsonl
+output_path: data/sft/medical_sft_top100k_by_ceval_similarity.jsonl
+report_path: data/sft/medical_sft_top100k_by_ceval_similarity_report.json
+
+embedding_backend: transformers
+embedding_model: BAAI/bge-small-zh-v1.5
+device: auto
+batch_size: 32
+target_batch_size: 64
+max_length: 512
+top_k: 100000
+log_every: 500
+
+# Useful for local logic tests without downloading an embedding model.
+hash_embedding_dim: 384
+
+text_template: "指令：{instruction}\n问题：{input}\n回答：{output}"

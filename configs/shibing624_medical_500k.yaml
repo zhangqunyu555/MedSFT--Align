@@ -1,0 +1,13 @@
+# Default configuration for preparing the 500k shibing624/medical SFT candidate set.
+
+dataset_name: shibing624/medical
+subset: finetune
+source_url: https://huggingface.co/datasets/shibing624/medical/resolve/main/finetune/train_zh_0.json
+local_source_path:
+
+sample_size: 500000
+strategy: first
+seed: 42
+
+output_path: data/raw/shibing624_medical/medical_zh_500k.jsonl
+report_path: data/raw/shibing624_medical/medical_zh_500k_report.json
