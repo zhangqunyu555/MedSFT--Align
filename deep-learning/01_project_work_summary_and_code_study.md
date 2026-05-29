@@ -1520,3 +1520,1409 @@ vs
 
 这就是这个项目目前最重要的工程价值：它不是一次性脚本，而是一条能反复实验和对照的后训练流水线。
 
+## 17. 关键函数源码精读
+
+前面几章偏“流程理解”，这一章开始进入“源码精读”。每个小节都会先贴出当前项目里的关键函数实现，再解释它具体在做什么、每段代码为什么这样写。
+
+### 17.1 `prepare_shibing624_medical_sft.py`：50 万候选集准备
+
+这个脚本负责从 `shibing624/medical` 中读取中文医疗 SFT 数据，并生成固定规模的 Alpaca JSONL 候选集。
+
+#### 函数：`open_source()`
+
+##### 这段代码完整实现
+
+```python
+def open_source(config: dict[str, Any]) -> tuple[BinaryIO, str]:
+    local_source = str(config.get("local_source_path") or "").strip()
+    if local_source:
+        path = Path(local_source)
+        if not path.exists():
+            raise FileNotFoundError(f"Local source does not exist: {path}")
+        return path.open("rb"), str(path)
+
+    source_url = str(config["source_url"]).strip()
+    request = Request(source_url, headers={"User-Agent": "MedSFT-Align/shibing624-preparer"})
+    return urlopen(request, timeout=120), source_url
+```
+
+##### 这段代码在做什么
+
+`open_source()` 负责打开原始数据源。它优先读取本地文件，如果配置里没有本地路径，就从 Hugging Face 的 raw URL 下载。
+
+##### 逐段解释
+
+- `local_source = str(config.get("local_source_path") or "").strip()`：从配置里取本地源文件路径。如果没有配置，就变成空字符串。
+- `if local_source:`：只要本地路径非空，就优先走本地读取。
+- `Path(local_source)`：把字符串路径转成 `Path` 对象，后面可以方便检查文件是否存在。
+- `if not path.exists()`：如果用户配置了本地路径但文件不存在，直接抛错，避免静默切换到远程下载。
+- `return path.open("rb"), str(path)`：用二进制方式打开文件。这里返回两个东西：文件流和来源描述。
+- 如果没有本地路径，就取 `source_url`。
+- `Request(..., headers={"User-Agent": ...})`：加 User-Agent，避免一些服务拒绝默认 Python 请求。
+- `urlopen(request, timeout=120)`：打开远程 URL，超时时间 120 秒。
+
+##### 为什么这里要这样写
+
+`shibing624/medical` 原始文件很大，不适合每次都重新下载。这个函数让脚本既支持第一次联网下载，也支持之后复用本地文件。返回文件流而不是一次性读入内容，是为了处理 GB 级数据时节省内存。
+
+#### 函数：`iter_source_records()`
+
+##### 这段代码完整实现
+
+```python
+def iter_source_records(stream: BinaryIO) -> Iterable[dict[str, Any]]:
+    prefix = read_until_first_non_whitespace(stream)
+    if not prefix:
+        return
+    if prefix[-1:] == b"[":
+        prefixed = PrefixStream(prefix, stream)
+        yield from iter_json_array(prefixed)
+        return
+    yield from iter_jsonl_from_prefix(stream, prefix)
+```
+
+##### 这段代码在做什么
+
+这个函数判断源文件到底是 JSON array 还是 JSONL，并统一产出一条条 Python dict。
+
+##### 逐段解释
+
+- `prefix = read_until_first_non_whitespace(stream)`：从文件流里读到第一个非空白字符为止。
+- `if not prefix: return`：如果文件为空，直接结束生成器。
+- `if prefix[-1:] == b"[":`：如果第一个非空字符是 `[`，说明源文件是 JSON array。
+- `PrefixStream(prefix, stream)`：因为前面已经读走了一个字符，所以这里用 `PrefixStream` 把这个前缀字符补回去，让后续解析器看到完整内容。
+- `yield from iter_json_array(prefixed)`：按 JSON array 的方式流式解析。
+- 如果不是 `[`，就按 JSONL 处理：`yield from iter_jsonl_from_prefix(stream, prefix)`。
+
+##### 为什么这里要这样写
+
+不同数据源可能有不同存储格式。如果只支持 JSONL，遇到 JSON array 会失败；如果用 `json.load()` 读 JSON array，又会一次性把大文件读入内存。这里通过识别首字符，把两种格式都接入统一的迭代接口。
+
+#### 函数：`normalize_record()`
+
+##### 这段代码完整实现
+
+```python
+def normalize_record(record: dict[str, Any], row_id: int) -> tuple[dict[str, Any] | None, str | None]:
+    instruction = str(record.get("instruction", "")).strip()
+    input_text = str(record.get("input", "")).strip()
+    output = str(record.get("output", "")).strip()
+
+    if not instruction:
+        instruction = "请回答以下医疗问题"
+    if not output:
+        return None, "missing_output"
+    if not input_text and not instruction:
+        return None, "missing_input"
+
+    return (
+        {
+            "instruction": instruction,
+            "input": input_text,
+            "output": output,
+            "source": "shibing624/medical",
+            "row_id": row_id,
+        },
+        None,
+    )
+```
+
+##### 这段代码在做什么
+
+它把源数据的一条记录统一成 Alpaca 格式，并过滤掉没有答案的坏样本。
+
+##### 逐段解释
+
+- 前三行分别取 `instruction`、`input`、`output`，并转成字符串、去掉首尾空白。
+- 如果 `instruction` 为空，就给一个默认指令：`请回答以下医疗问题`。
+- 如果 `output` 为空，说明没有训练目标，返回 `None` 和过滤原因 `missing_output`。
+- 如果 `input_text` 和 `instruction` 都没有，说明没有用户输入，也跳过。
+- 正常样本返回一个标准 dict，包含 `instruction`、`input`、`output`、`source`、`row_id`。
+
+##### 关键变量解释
+
+- `row_id`：源数据中的行序号，用于回溯样本来源。
+- `source`：固定写成 `shibing624/medical`，方便后面分析数据来自哪里。
+- 返回值中的第二项是错误原因；如果为 `None`，说明样本有效。
+
+#### 函数：`prepare_first()`
+
+##### 这段代码完整实现
+
+```python
+def prepare_first(config: dict[str, Any]) -> Counter:
+    sample_size = int(config["sample_size"])
+    output_path = Path(config["output_path"])
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    stats: Counter = Counter()
+
+    stream, source = open_source(config)
+    stats["source_opened"] = 1
+    try:
+        with output_path.open("w", encoding="utf-8") as output_file:
+            for row_id, raw_record in enumerate(iter_source_records(stream)):
+                stats["total_seen"] += 1
+                record, reason = normalize_record(raw_record, row_id)
+                if reason:
+                    stats[reason] += 1
+                    continue
+                write_jsonl_line(output_file, record)
+                stats["kept"] += 1
+                if stats["kept"] >= sample_size:
+                    break
+    finally:
+        stream.close()
+    stats["source"] = source
+    return stats
+```
+
+##### 这段代码在做什么
+
+它按顺序读取源数据，保留前 `sample_size` 条有效样本。当前配置里 `sample_size=500000`，所以最终生成 50 万候选集。
+
+##### 逐段解释
+
+- `sample_size = int(config["sample_size"])`：读取目标样本数。
+- `output_path.parent.mkdir(...)`：确保输出目录存在。
+- `stats = Counter()`：用计数器记录读取数量、保留数量、过滤原因。
+- `stream, source = open_source(config)`：打开本地或远程数据源。
+- `for row_id, raw_record in enumerate(iter_source_records(stream)):`：流式遍历每条源记录。
+- `stats["total_seen"] += 1`：每看到一条源记录就计数。
+- `record, reason = normalize_record(...)`：标准化字段。
+- `if reason:`：如果样本无效，就统计原因并跳过。
+- `write_jsonl_line(output_file, record)`：有效样本写入 JSONL。
+- `if stats["kept"] >= sample_size: break`：达到 50 万后停止。
+- `finally: stream.close()`：无论中间是否出错，都关闭流。
+
+##### 为什么这里要这样写
+
+顺序取前 50 万的好处是快、稳定、可复现。相比随机抽样，它不用读取完整大文件，也不会因为随机种子或源文件变动导致结果难以追踪。
+
+#### 函数：`write_report()`
+
+##### 这段代码完整实现
+
+```python
+def write_report(config: dict[str, Any], stats: Counter, elapsed_seconds: float) -> None:
+    report_path = Path(config["report_path"])
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report = {
+        "dataset_name": config["dataset_name"],
+        "subset": config["subset"],
+        "source_url": config["source_url"],
+        "local_source_path": config.get("local_source_path") or "",
+        "sample_size": int(config["sample_size"]),
+        "strategy": config["strategy"],
+        "seed": int(config["seed"]),
+        "output_path": config["output_path"],
+        "report_path": config["report_path"],
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "stats": dict(stats),
+    }
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+```
+
+##### 这段代码在做什么
+
+它把本次 50 万数据生成过程写成 JSON 报告，方便复现和检查。
+
+##### 逐段解释
+
+- `report_path.parent.mkdir(...)`：确保报告目录存在。
+- `report = {...}`：把数据集名称、来源 URL、采样策略、样本数、输出路径、运行时间和统计信息都收集起来。
+- `ensure_ascii=False`：保证中文正常写出，而不是变成 Unicode 转义。
+- `indent=2`：让 JSON 报告可读。
+
+##### 为什么这里要这样写
+
+深度学习实验必须知道数据是怎么来的。只保存训练文件不够，还要保存生成训练文件的配置和统计信息。
+
+### 17.2 `clean_corpus.py`：50 万语料清洗
+
+#### 函数：`normalize_text()`
+
+##### 这段代码完整实现
+
+```python
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    text = html.unescape(text)
+    text = unicodedata.normalize("NFKC", text)
+    text = HTML_TAG_RE.sub(" ", text)
+    text = CONTROL_RE.sub("", text)
+    text = text.replace("\u200b", "").replace("\ufeff", "")
+    text = SPACE_RE.sub(" ", text)
+    text = "\n".join(part.strip() for part in text.splitlines())
+    text = BLANK_LINE_RE.sub("\n\n", text)
+    return text.strip()
+```
+
+##### 这段代码在做什么
+
+它把输入文本做标准化，清理 HTML、控制字符、异常空白和不可见字符。
+
+##### 逐段解释
+
+- `if value is None: return ""`：空值直接变成空字符串，避免后面 `str(None)` 变成 `"None"`。
+- `html.unescape(text)`：把 `&nbsp;`、`&lt;` 等 HTML 实体还原。
+- `unicodedata.normalize("NFKC", text)`：统一 Unicode 表示，例如全角字符转兼容形式。
+- `HTML_TAG_RE.sub(" ", text)`：删除 HTML 标签。
+- `CONTROL_RE.sub("", text)`：删除控制字符。
+- `replace("\u200b", "")` 和 `replace("\ufeff", "")`：删除零宽字符和 BOM。
+- `SPACE_RE.sub(" ", text)`：多个空格、制表符等压成一个空格。
+- `"\n".join(part.strip() for part in text.splitlines())`：逐行去除首尾空白。
+- `BLANK_LINE_RE.sub("\n\n", text)`：超过两行的空行压成两行。
+
+##### 为什么这里要这样写
+
+医疗数据常来自网页、问答平台、复制粘贴内容，里面有很多格式噪声。清理这些噪声可以降低 tokenizer 无意义负担，也能提高去重准确性。
+
+#### 函数：`contains_ad_or_contact()`
+
+##### 这段代码完整实现
+
+```python
+def contains_ad_or_contact(text: str, config: dict[str, Any]) -> bool:
+    if any(keyword and keyword in text for keyword in config["ad_keywords"]):
+        return True
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in config["contact_patterns"])
+```
+
+##### 这段代码在做什么
+
+它判断一段文本是否包含广告关键词或联系方式。
+
+##### 逐段解释
+
+- 第一行 `any(keyword and keyword in text ...)` 检查关键词，例如“加微信”“联系电话”“免费咨询”。
+- 第二行用正则检查 URL、手机号、邮箱、微信号、QQ 等联系方式。
+- `re.IGNORECASE` 让大小写不敏感，例如 `VX` 和 `vx` 都能匹配。
+
+##### 为什么这里要这样写
+
+训练医疗模型不能让模型学习引流话术。广告和联系方式会污染回答风格，也可能带来安全风险。
+
+#### 函数：`validate_lengths()`
+
+##### 这段代码完整实现
+
+```python
+def validate_lengths(question: str, answer: str, config: dict[str, Any]) -> str | None:
+    q_len = count_content_chars(question)
+    a_len = count_content_chars(answer)
+    if q_len == 0 or a_len == 0:
+        return "empty_field"
+    if q_len < config["min_question_chars"] or a_len < config["min_answer_chars"]:
+        return "too_short"
+    if q_len > config["max_question_chars"] or a_len > config["max_answer_chars"]:
+        return "too_long"
+    return None
+```
+
+##### 这段代码在做什么
+
+它检查问题和答案长度是否合理。
+
+##### 逐段解释
+
+- `count_content_chars()` 会去掉空白后计算内容长度。
+- 如果问题或答案长度为 0，返回 `empty_field`。
+- 如果低于最小长度，返回 `too_short`。
+- 如果超过最大长度，返回 `too_long`。
+- 如果没有问题，返回 `None`，表示通过。
+
+##### 为什么这里要这样写
+
+过短样本往往信息量不足，过长样本容易是网页复制、说明书或异常内容。长度过滤是低成本但很有效的数据质量控制。
+
+#### 函数：`repair_conversations()`
+
+##### 这段代码完整实现
+
+```python
+def repair_conversations(
+    conversations: Any, config: dict[str, Any]
+) -> tuple[list[dict[str, str]] | None, bool]:
+    if not isinstance(conversations, list):
+        return None, False
+
+    repaired: list[dict[str, str]] = []
+    changed = False
+    for message in conversations:
+        if not isinstance(message, dict):
+            changed = True
+            continue
+        role = normalize_role(message_role(message), config)
+        value = normalize_text(message_value(message))
+        if role is None or not value:
+            changed = True
+            continue
+        if repaired and repaired[-1]["from"] == role:
+            repaired[-1]["value"] = normalize_text(repaired[-1]["value"] + "\n" + value)
+            changed = True
+        else:
+            repaired.append({"from": role, "value": value})
+
+    while repaired and repaired[0]["from"] != "human":
+        repaired.pop(0)
+        changed = True
+    while repaired and repaired[-1]["from"] != "gpt":
+        repaired.pop()
+        changed = True
+
+    if len(repaired) < 2:
+        return None, changed
+    for index, message in enumerate(repaired):
+        expected = "human" if index % 2 == 0 else "gpt"
+        if message["from"] != expected:
+            return None, True
+
+    return repaired, changed
+```
+
+##### 这段代码在做什么
+
+它修复 ShareGPT 多轮对话，保证对话结构是 `human -> gpt -> human -> gpt`。
+
+##### 逐段解释
+
+- 如果 `conversations` 不是列表，直接失败。
+- 遍历每条 message，要求每条 message 是 dict。
+- `normalize_role()` 把 `user`、`assistant`、`医生`、`患者` 等角色统一成 `human` / `gpt`。
+- `normalize_text()` 清理消息内容。
+- 如果连续两条消息角色相同，就合并内容。
+- 开头如果不是 `human`，就不断弹出。
+- 结尾如果不是 `gpt`，就不断弹出。
+- 如果修复后少于 2 条消息，说明无法构成一问一答。
+- 最后检查偶数位必须是 `human`，奇数位必须是 `gpt`。
+
+##### 为什么这里要这样写
+
+SFT 训练时模型要学习“用户输入 -> 助手回答”的映射。如果对话开头是助手，或者连续出现两个用户消息，训练标签就会错位，导致模型学习混乱。
+
+#### 函数：`extract_single_turn()`
+
+##### 这段代码完整实现
+
+```python
+def extract_single_turn(record: dict[str, Any], config: dict[str, Any]) -> tuple[str, str, str]:
+    instruction = normalize_text(pick_first(record, config["instruction_fields"]))
+    input_text = normalize_text(pick_first(record, config["input_fields"]))
+    output = normalize_text(pick_first(record, config["output_fields"]))
+
+    if instruction and output:
+        question = normalize_text(f"{instruction}\n{input_text}" if input_text else instruction)
+        return instruction, input_text, output
+
+    question = normalize_text(pick_first(record, config["question_fields"]))
+    answer = normalize_text(pick_first(record, config["answer_fields"]))
+    return "请回答以下医疗问题", question, answer
+```
+
+##### 这段代码在做什么
+
+它从一条记录中提取单轮问答，并兼容 Alpaca 格式和普通 QA 格式。
+
+##### 逐段解释
+
+- 先尝试取 Alpaca 字段：`instruction`、`input`、`output`。
+- 如果 `instruction` 和 `output` 都存在，说明是 Alpaca 样本，直接返回。
+- 如果不是 Alpaca，就尝试取 `question` / `answer` 这类 QA 字段。
+- 对 QA 样本统一补一个默认 instruction：`请回答以下医疗问题`。
+
+##### 为什么这里要这样写
+
+不同医疗数据集字段名不一样。这个函数让清洗脚本不绑定单一数据格式，后续可以复用到更多数据源。
+
+#### 函数：`dedup_key_from_pair()`
+
+##### 这段代码完整实现
+
+```python
+def dedup_key_from_pair(question: str, answer: str) -> str:
+    text = compact_for_dedup(question) + "\n" + compact_for_dedup(answer)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+```
+
+##### 这段代码在做什么
+
+它为单轮问答生成去重 key。
+
+##### 逐段解释
+
+- `compact_for_dedup(question)`：去掉空白并转小写。
+- `compact_for_dedup(answer)`：答案也做同样处理。
+- 中间加换行，避免问题和答案边界混在一起。
+- `hashlib.sha256(...)`：生成固定长度哈希值。
+
+##### 为什么这里要这样写
+
+直接用原文去重会受空格、换行、大小写影响。压缩后再哈希，可以识别更多“内容相同但格式略不同”的重复样本。
+
+#### 函数：`clean_corpus()`
+
+##### 这段代码完整实现
+
+```python
+def clean_corpus(config: dict[str, Any]) -> Counter:
+    input_path = Path(config["input_path"])
+    output_dir = Path(config["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    files = iter_jsonl_files(input_path)
+    report: Counter = Counter()
+    report["input_files"] = len(files)
+
+    seen: set[str] = set()
+    alpaca_path = output_dir / "cleaned_alpaca.jsonl"
+    sharegpt_path = output_dir / "cleaned_sharegpt.jsonl"
+
+    with alpaca_path.open("w", encoding="utf-8") as alpaca_out, sharegpt_path.open(
+        "w", encoding="utf-8"
+    ) as sharegpt_out:
+        for file_path in files:
+            with file_path.open("r", encoding="utf-8") as input_file:
+                for line_number, line in enumerate(input_file, start=1):
+                    if not line.strip():
+                        continue
+                    report["total_read"] += 1
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        report["invalid_json"] += 1
+                        continue
+                    if not isinstance(record, dict):
+                        report["invalid_record"] += 1
+                        continue
+
+                    conversations = extract_conversations(record, config)
+                    if conversations:
+                        messages, changed = repair_conversations(conversations, config)
+                        if changed:
+                            report["multi_turn_repaired"] += 1
+                        if not messages:
+                            report["multi_turn_failed"] += 1
+                            continue
+
+                        text_for_filter = "\n".join(item["value"] for item in messages)
+                        if contains_ad_or_contact(text_for_filter, config):
+                            report["ad_or_contact"] += 1
+                            continue
+
+                        key = dedup_key_from_messages(messages)
+                        if config["enable_dedup"] and key in seen:
+                            report["duplicate"] += 1
+                            continue
+                        seen.add(key)
+
+                        write_jsonl(sharegpt_out, {"conversations": messages})
+                        report["sharegpt_kept"] += 1
+                        report["kept"] += 1
+                        continue
+
+                    instruction, input_text, answer = extract_single_turn(record, config)
+                    question = normalize_text(f"{instruction}\n{input_text}" if input_text else input_text)
+                    question_for_validation = normalize_text(input_text or instruction)
+                    if instruction == "请回答以下医疗问题":
+                        question = input_text
+                        question_for_validation = input_text
+
+                    reason = validate_lengths(question_for_validation, answer, config)
+                    if reason:
+                        report[reason] += 1
+                        continue
+                    if contains_ad_or_contact(question + "\n" + answer, config):
+                        report["ad_or_contact"] += 1
+                        continue
+
+                    key = dedup_key_from_pair(question_for_validation, answer)
+                    if config["enable_dedup"] and key in seen:
+                        report["duplicate"] += 1
+                        continue
+                    seen.add(key)
+
+                    write_jsonl(
+                        alpaca_out,
+                        {"instruction": instruction, "input": input_text, "output": answer},
+                    )
+                    report["alpaca_kept"] += 1
+                    report["kept"] += 1
+
+    report_path = output_dir / "cleaning_report.json"
+    report_data = {
+        "input_path": str(input_path),
+        "output_dir": str(output_dir),
+        "alpaca_output": str(alpaca_path),
+        "sharegpt_output": str(sharegpt_path),
+        "stats": dict(sorted(report.items())),
+    }
+    report_path.write_text(json.dumps(report_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report
+```
+
+##### 这段代码在做什么
+
+这是清洗脚本的主流程。它负责读取 JSONL、判断样本类型、执行清洗过滤、去重、写出 Alpaca 或 ShareGPT 文件，并生成报告。
+
+##### 逐段解释
+
+- 初始化部分：读取输入路径、输出目录，创建输出目录。
+- `files = iter_jsonl_files(input_path)`：支持输入一个文件或一个目录。
+- `seen`：保存去重 key，防止重复样本进入输出。
+- 同时打开两个输出文件：`cleaned_alpaca.jsonl` 和 `cleaned_sharegpt.jsonl`。
+- 每行先做 JSON 解析，坏 JSON 计入 `invalid_json`。
+- 如果记录里有 `conversations`，走多轮清洗路径。
+- 多轮路径里先修复角色，再过滤广告联系方式，再去重，再写 ShareGPT。
+- 如果没有多轮字段，走单轮 Alpaca / QA 路径。
+- 单轮路径里提取字段、验证长度、过滤广告、去重，然后写 Alpaca。
+- 最后写 `cleaning_report.json`。
+
+##### 为什么这里要这样写
+
+这个函数把“数据质量控制”集中在一个地方。它既支持单轮问答，又支持多轮对话；既能输出训练数据，又能输出清洗报告。对 50 万规模数据来说，一行一行流式处理也比一次性读入更稳。
+
+### 17.3 `build_ceval_medical_jsonl.py`：C-Eval 医学目标集构建
+
+#### 函数：`fetch_rows_with_retries()`
+
+##### 这段代码完整实现
+
+```python
+def fetch_rows_with_retries(
+    subject: str,
+    split: str,
+    offset: int,
+    length: int,
+    timeout: int,
+    retries: int,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(retries + 1):
+        try:
+            return fetch_rows(subject, split, offset, length, timeout)
+        except (HTTPError, URLError, TimeoutError, http.client.RemoteDisconnected) as exc:
+            last_error = exc
+            if attempt >= retries:
+                raise
+            time.sleep(min(2**attempt, 8))
+    raise RuntimeError(f"Unexpected retry failure: {last_error}")
+```
+
+##### 这段代码在做什么
+
+它封装了 C-Eval 数据下载的重试逻辑。
+
+##### 逐段解释
+
+- `for attempt in range(retries + 1)`：总共尝试 `retries + 1` 次。
+- `return fetch_rows(...)`：如果下载成功，直接返回 payload。
+- `except (...) as exc`：捕获网络错误、HTTP 错误、超时、远端断开。
+- `if attempt >= retries: raise`：如果已经达到最大重试次数，就把异常抛出去。
+- `time.sleep(min(2**attempt, 8))`：指数退避等待，最多等 8 秒。
+
+##### 为什么这里要这样写
+
+下载数据时网络抖动很常见。重试能避免一次临时失败导致整个目标集构建失败。
+
+#### 函数：`iter_dataset_rows()`
+
+##### 这段代码完整实现
+
+```python
+def iter_dataset_rows(
+    subject: str,
+    split: str,
+    page_size: int,
+    timeout: int,
+    retries: int,
+    limit: int | None,
+    sleep_seconds: float,
+) -> tuple[list[dict[str, Any]], Counter]:
+    rows: list[dict[str, Any]] = []
+    stats: Counter = Counter()
+    offset = 0
+
+    while True:
+        length = page_size
+        if limit is not None:
+            remaining = limit - len(rows)
+            if remaining <= 0:
+                break
+            length = min(length, remaining)
+
+        payload = fetch_rows_with_retries(subject, split, offset, length, timeout, retries)
+        page_rows = payload.get("rows", [])
+        total = payload.get("num_rows_total")
+        stats["pages"] += 1
+        stats["api_rows"] += len(page_rows)
+
+        if not page_rows:
+            break
+
+        for item in page_rows:
+            row = item.get("row", item)
+            if isinstance(row, dict):
+                rows.append(row)
+
+        offset += len(page_rows)
+        if total is not None and offset >= int(total):
+            break
+        if len(page_rows) < length:
+            break
+        if sleep_seconds > 0:
+            time.sleep(sleep_seconds)
+
+    return rows, stats
+```
+
+##### 这段代码在做什么
+
+它分页下载某个 subject / split 的所有 C-Eval 行。
+
+##### 逐段解释
+
+- `rows` 保存下载到的数据。
+- `offset` 表示当前分页起点。
+- `length = page_size` 表示每页下载多少条。
+- 如果传了 `limit`，就只下载指定数量，方便 smoke test。
+- `payload.get("rows", [])` 取 API 返回的行。
+- `payload.get("num_rows_total")` 取总行数，用来判断是否下载完。
+- `item.get("row", item)` 是为了兼容 Dataset Viewer API 的包装结构。
+- `offset += len(page_rows)` 移动分页窗口。
+- 如果已经达到总数、当前页不足一页、或者没有返回数据，就结束。
+
+##### 为什么这里要这样写
+
+分页下载比一次性下载更稳，也更容易限制样本数做测试。
+
+#### 函数：`build_question_only_target_text()`
+
+##### 这段代码完整实现
+
+```python
+def build_question_only_target_text(subject_zh: str, question: str) -> str:
+    return f"科目：{subject_zh}\n题目：{question}"
+```
+
+##### 解释
+
+这个函数生成“不带答案”的 embedding 目标文本，只包含科目和题干。它用于主实验，避免正确答案直接影响筛选。
+
+#### 函数：`build_question_answer_target_text()`
+
+##### 这段代码完整实现
+
+```python
+def build_question_answer_target_text(subject_zh: str, question: str, answer: str, answer_text: str) -> str:
+    return f"科目：{subject_zh}\n题目：{question}\n正确答案：{answer}. {answer_text}"
+```
+
+##### 解释
+
+这个函数生成“带答案”的 embedding 目标文本。它把正确选项也拼进去，用来做对照实验，看“题干 + 正确知识点”会不会筛出不同的数据。
+
+#### 函数：`convert_row()`
+
+##### 这段代码完整实现
+
+```python
+def convert_row(
+    row: dict[str, Any], subject: str, split: str, fallback_index: int
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str | None]:
+    question = clean_text(row.get("question"))
+    if not question:
+        return None, None, "missing_question"
+
+    options = {choice: clean_text(row.get(choice)) for choice in CHOICES}
+    if any(not options[choice] for choice in CHOICES):
+        return None, None, "missing_option"
+
+    answer = clean_text(row.get("answer")).upper()
+    if not answer:
+        return None, None, "missing_answer"
+    if answer not in options:
+        return None, None, "invalid_answer"
+
+    answer_text = options[answer]
+    if not answer_text:
+        return None, None, "missing_answer_text"
+
+    row_id = row.get("id", fallback_index)
+    subject_zh = SUBJECT_ZH.get(subject, subject)
+    record_id = f"{subject}-{split}-{row_id}"
+    question_with_answer = build_question_with_answer(question, answer, answer_text)
+    question_only_target_text = build_question_only_target_text(subject_zh, question)
+    question_answer_target_text = build_question_answer_target_text(
+        subject_zh, question, answer, answer_text
+    )
+
+    base_record = {
+        "id": record_id,
+        "source": DATASET,
+        "subject": subject,
+        "subject_zh": subject_zh,
+        "split": split,
+        "question": question,
+        "options": options,
+    }
+    question_only_record = {
+        **base_record,
+        "target_text": question_only_target_text,
+    }
+    question_answer_record = {
+        **base_record,
+        "answer": answer,
+        "answer_text": answer_text,
+        "explanation": clean_text(row.get("explanation")),
+        "question_with_answer": question_with_answer,
+        "target_text": question_answer_target_text,
+    }
+    return question_only_record, question_answer_record, None
+```
+
+##### 这段代码在做什么
+
+它把一条 C-Eval 原始题转换成两条记录：不带答案版本和带答案版本。
+
+##### 逐段解释
+
+- 先取 `question`，没有题干就返回 `missing_question`。
+- `options = {choice: ... for choice in CHOICES}` 把 A/B/C/D 选项统一放到字典里。
+- 如果任何选项为空，返回 `missing_option`。
+- 读取 `answer` 并转成大写。
+- 如果答案不在 A/B/C/D 中，返回 `invalid_answer`。
+- `answer_text = options[answer]` 根据答案字母取正确选项文本。
+- `record_id = f"{subject}-{split}-{row_id}"` 生成稳定 ID。
+- `base_record` 保存两个文件都共享的字段。
+- `question_only_record` 只增加不带答案的 `target_text`。
+- `question_answer_record` 增加答案字段和带答案的 `target_text`。
+
+##### 为什么这里要这样写
+
+两个目标集使用同一个 `id`，这样后面可以对比同一道题在“不带答案”和“带答案”两种 embedding 目标下筛出的训练样本差异。
+
+### 17.4 `filter_by_ceval_similarity.py`：向量相似筛选
+
+#### 函数：`normalize_rows()`
+
+##### 这段代码完整实现
+
+```python
+def normalize_rows(embeddings: torch.Tensor) -> torch.Tensor:
+    return torch.nn.functional.normalize(embeddings, p=2, dim=1)
+```
+
+##### 解释
+
+这行代码对每一行 embedding 做 L2 归一化。归一化后向量长度为 1，此时两个向量点积就是余弦相似度。
+
+#### 类：`TransformersEmbedder`
+
+##### 这段代码完整实现
+
+```python
+class TransformersEmbedder:
+    def __init__(self, model_name: str, device: str, max_length: int) -> None:
+        from transformers import AutoModel, AutoTokenizer
+
+        self.device = device
+        self.max_length = max_length
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name)
+        self.model.to(device)
+        self.model.eval()
+
+    def encode(self, texts: list[str]) -> torch.Tensor:
+        encoded = self.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        encoded = {key: value.to(self.device) for key, value in encoded.items()}
+        with torch.no_grad():
+            output = self.model(**encoded)
+            token_embeddings = output.last_hidden_state
+            attention_mask = encoded["attention_mask"].unsqueeze(-1).float()
+            summed = (token_embeddings * attention_mask).sum(dim=1)
+            counts = attention_mask.sum(dim=1).clamp(min=1e-9)
+            embeddings = summed / counts
+            embeddings = normalize_rows(embeddings)
+        return embeddings.cpu()
+```
+
+##### 这段代码在做什么
+
+它用 Hugging Face Transformers 加载 embedding 模型，并把文本编码成向量。
+
+##### 逐段解释
+
+- `AutoTokenizer.from_pretrained(model_name)`：加载 tokenizer。
+- `AutoModel.from_pretrained(model_name)`：加载 embedding 模型。
+- `self.model.to(device)`：把模型放到 GPU、MPS 或 CPU。
+- `self.model.eval()`：推理模式，不启用训练行为。
+- `self.tokenizer(...)`：对文本 batch 做 padding、truncation，并转成 tensor。
+- `encoded = {key: value.to(self.device) ...}`：把输入 tensor 移到设备上。
+- `with torch.no_grad()`：不计算梯度，节省显存。
+- `output.last_hidden_state`：取每个 token 的隐藏向量。
+- `attention_mask`：标记哪些 token 是真实内容，哪些是 padding。
+- `summed / counts`：mean pooling，得到句向量。
+- `normalize_rows(embeddings)`：把向量归一化。
+- `return embeddings.cpu()`：把结果放回 CPU，便于后续矩阵计算和堆维护。
+
+##### 为什么这里要这样写
+
+BGE 这类模型输出的是 token 级 hidden states，需要 pooling 成文本级向量。用 attention mask 做平均可以避免 padding token 干扰结果。
+
+#### 类：`HashEmbedder`
+
+##### 这段代码完整实现
+
+```python
+class HashEmbedder:
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+
+    def encode(self, texts: list[str]) -> torch.Tensor:
+        vectors = np.zeros((len(texts), self.dim), dtype=np.float32)
+        for row_idx, text in enumerate(texts):
+            for token in text.split():
+                digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+                value = int.from_bytes(digest, "little")
+                col = value % self.dim
+                sign = 1.0 if (value >> 8) & 1 else -1.0
+                vectors[row_idx, col] += sign
+            if not text.split():
+                digest = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+                vectors[row_idx, int.from_bytes(digest, "little") % self.dim] = 1.0
+        return normalize_rows(torch.from_numpy(vectors))
+```
+
+##### 这段代码在做什么
+
+它不用真实模型，而是用哈希方法把文本转成固定维度向量，主要用于 smoke test。
+
+##### 逐段解释
+
+- `vectors = np.zeros(...)`：创建一个全零矩阵。
+- 遍历文本中的 token。
+- `hashlib.blake2b(...)`：对 token 做哈希。
+- `col = value % self.dim`：决定这个 token 落在哪个向量维度上。
+- `sign`：决定加 1 还是减 1，减少哈希碰撞偏置。
+- 如果文本为空，也给一个固定位置赋值，避免全零向量。
+- 最后归一化。
+
+##### 为什么这里要这样写
+
+它不用于正式实验，只用于快速验证脚本流程。在没下载 embedding 模型、没 GPU 的情况下，也能检查输入输出和 Top-K 逻辑。
+
+#### 函数：`load_targets()`
+
+##### 这段代码完整实现
+
+```python
+def load_targets(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    targets = list(iter_jsonl(path))
+    texts = [str(item.get("target_text", "")).strip() for item in targets]
+    if not targets:
+        raise ValueError(f"No target rows found: {path}")
+    if any(not text for text in texts):
+        raise ValueError(f"All target rows must contain non-empty target_text: {path}")
+    return targets, texts
+```
+
+##### 解释
+
+它读取 C-Eval 目标集，并提取每条记录的 `target_text`。如果目标集为空，或者有任何一条没有 `target_text`，就直接报错。
+
+#### 函数：`build_candidate_text()`
+
+##### 这段代码完整实现
+
+```python
+def build_candidate_text(record: dict[str, Any], template: str) -> str:
+    return template.format(
+        instruction=str(record.get("instruction", "")).strip(),
+        input=str(record.get("input", "")).strip(),
+        output=str(record.get("output", "")).strip(),
+    ).strip()
+```
+
+##### 解释
+
+它把一条 Alpaca 样本拼成 embedding 文本。默认模板是：
+
+```text
+指令：{instruction}
+问题：{input}
+回答：{output}
+```
+
+这一步会把问题和答案都放入相似度计算，因为筛选的是训练样本，不只是筛问题。
+
+#### 函数：`update_heap()`
+
+##### 这段代码完整实现
+
+```python
+def update_heap(
+    heap: list[tuple[float, int, dict[str, Any]]],
+    top_k: int,
+    record: dict[str, Any],
+    score: float,
+    sequence_id: int,
+) -> None:
+    item = (score, sequence_id, record)
+    if len(heap) < top_k:
+        heapq.heappush(heap, item)
+        return
+    if score > heap[0][0]:
+        heapq.heapreplace(heap, item)
+```
+
+##### 这段代码在做什么
+
+它用最小堆维护当前相似度最高的 Top-K 样本。
+
+##### 逐段解释
+
+- `item = (score, sequence_id, record)`：堆元素包含分数、序号、样本。
+- 如果堆还没满，直接 push。
+- 如果堆满了，就看新分数是否大于堆顶。
+- 堆顶 `heap[0]` 是当前 Top-K 里分数最低的样本。
+- 如果新样本更好，就用 `heapreplace()` 替换堆顶。
+
+##### 为什么这里要这样写
+
+当数据规模很大时，不需要保存全部样本再排序。最小堆只保留 K 条，占用内存更稳定。
+
+#### 函数：`enrich_record()`
+
+##### 这段代码完整实现
+
+```python
+def enrich_record(
+    record: dict[str, Any],
+    score: float,
+    best_target: dict[str, Any],
+) -> dict[str, Any]:
+    enriched = dict(record)
+    enriched["similarity_score"] = round(float(score), 8)
+    enriched["best_target_id"] = best_target.get("id")
+    enriched["best_target_subject"] = best_target.get("subject")
+    enriched["best_target_split"] = best_target.get("split")
+    enriched["best_target_text"] = best_target.get("target_text")
+    return enriched
+```
+
+##### 解释
+
+它给入选训练样本追加相似度元信息。后续分析时可以知道这条样本为什么被选中、最接近哪一道 C-Eval 题。
+
+#### 核心语句：相似度矩阵
+
+##### 这段代码完整实现
+
+```python
+candidate_embeddings = embedder.encode(batch_texts)
+score_matrix = candidate_embeddings @ target_embeddings.T
+best_scores, best_indices = score_matrix.max(dim=1)
+```
+
+##### 逐段解释
+
+- `candidate_embeddings` 是候选样本 batch 的向量。
+- `target_embeddings.T` 是 C-Eval 目标向量矩阵的转置。
+- `@` 是矩阵乘法。
+- 因为向量都做过 L2 normalize，所以矩阵乘法结果就是余弦相似度。
+- `score_matrix.max(dim=1)` 表示每条候选样本取最相似的那一道 C-Eval 题。
+
+### 17.5 `convert_alpaca_to_sharegpt.py`：Qwen3 训练格式转换
+
+#### 函数：`build_user_prompt()`
+
+##### 这段代码完整实现
+
+```python
+def build_user_prompt(instruction: str, input_text: str) -> str:
+    if instruction and input_text:
+        return f"{instruction}\n\n{input_text}"
+    return instruction or input_text
+```
+
+##### 解释
+
+如果 `instruction` 和 `input` 都存在，就把它们拼成一个用户 prompt；如果只有一个，就用那个字段。
+
+#### 函数：`convert_record()`
+
+##### 这段代码完整实现
+
+```python
+def convert_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    instruction = clean_text(record.get("instruction"))
+    input_text = clean_text(record.get("input"))
+    output = clean_text(record.get("output"))
+    user_prompt = build_user_prompt(instruction, input_text)
+
+    if not user_prompt or not output:
+        return None
+
+    return {
+        "conversations": [
+            {"from": "human", "value": user_prompt},
+            {"from": "gpt", "value": output},
+        ]
+    }
+```
+
+##### 逐段解释
+
+- 先清理 `instruction`、`input`、`output`。
+- `user_prompt` 是最终用户输入。
+- 如果用户输入或答案为空，就返回 `None`，表示跳过。
+- 输出格式是 MedicalGPT 需要的 ShareGPT conversations。
+
+##### 为什么这里要这样写
+
+MedicalGPT 的 SFT 入口读取的是 `conversations`，而不是 Alpaca 三字段。这里完成训练前格式转换。Qwen3 特殊 token 不在这里写，而是由训练时的 `--template_name qwen3` 处理。
+
+#### 函数：`convert_file()`
+
+##### 这段代码完整实现
+
+```python
+def convert_file(input_path: Path, output_path: Path, log_every: int) -> dict[str, Any]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = time.time()
+    total = 0
+    kept = 0
+    skipped = 0
+    bad_json = 0
+
+    with input_path.open("r", encoding="utf-8") as fin, output_path.open(
+        "w", encoding="utf-8"
+    ) as fout:
+        for line in fin:
+            total += 1
+            line = line.strip()
+            if not line:
+                skipped += 1
+                continue
+
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                bad_json += 1
+                skipped += 1
+                continue
+
+            converted = convert_record(record)
+            if converted is None:
+                skipped += 1
+                continue
+
+            fout.write(json.dumps(converted, ensure_ascii=False) + "\n")
+            kept += 1
+
+            if log_every > 0 and total % log_every == 0:
+                elapsed = time.time() - started_at
+                speed = total / elapsed if elapsed > 0 else 0.0
+                print(
+                    f"[progress] read={total} kept={kept} skipped={skipped} "
+                    f"speed={speed:.1f} rows/s",
+                    flush=True,
+                )
+
+    elapsed = time.time() - started_at
+    return {
+        "input": str(input_path),
+        "output": str(output_path),
+        "total_read": total,
+        "kept": kept,
+        "skipped": skipped,
+        "bad_json": bad_json,
+        "elapsed_seconds": round(elapsed, 3),
+    }
+```
+
+##### 逐段解释
+
+- 创建输出目录。
+- 初始化计数器：总读取、保留、跳过、坏 JSON。
+- 一行一行读取 JSONL。
+- 空行跳过。
+- JSON 解析失败计入 `bad_json`。
+- 转换失败计入 `skipped`。
+- 转换成功写入输出文件。
+- 每隔 `log_every` 行打印进度和速度。
+- 最后返回转换报告。
+
+##### 为什么这里要这样写
+
+这个脚本不依赖 `datasets`，适合在干净虚拟机上直接运行。流式处理也适合几十万行数据。
+
+### 17.6 `run_ceval_lm_eval.sh`：C-Eval 评估脚本
+
+#### 参数默认值区域
+
+##### 这段代码完整实现
+
+```bash
+MODEL="Qwen/Qwen3-4B-Instruct"
+ADAPTER=""
+TASKS="ceval-valid_clinical_medicine,ceval-valid_basic_medicine"
+OUTPUT_PATH="results/ceval/qwen3_4b_instruct"
+DEVICE="cuda:0"
+BATCH_SIZE="auto"
+DTYPE="bfloat16"
+LIMIT=""
+LOG_SAMPLES="true"
+TRUST_REMOTE_CODE="True"
+LM_EVAL_BIN="${LM_EVAL_BIN:-lm-eval}"
+```
+
+##### 解释
+
+这些是评估脚本默认参数。默认评估原始 Qwen3-4B-Instruct，在 C-Eval 临床医学和基础医学上跑，输出到 `results/ceval/qwen3_4b_instruct`。
+
+#### 参数解析逻辑
+
+##### 这段代码完整实现
+
+```bash
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --model)
+      MODEL="$2"
+      shift 2
+      ;;
+    --adapter)
+      ADAPTER="$2"
+      shift 2
+      ;;
+    --tasks)
+      TASKS="$2"
+      shift 2
+      ;;
+    --output)
+      OUTPUT_PATH="$2"
+      shift 2
+      ;;
+    --device)
+      DEVICE="$2"
+      shift 2
+      ;;
+    --batch-size)
+      BATCH_SIZE="$2"
+      shift 2
+      ;;
+    --dtype)
+      DTYPE="$2"
+      shift 2
+      ;;
+    --limit)
+      LIMIT="$2"
+      shift 2
+      ;;
+    --no-log-samples)
+      LOG_SAMPLES="false"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+```
+
+##### 解释
+
+这段代码让脚本支持命令行参数覆盖默认值。例如传 `--adapter` 就评估 LoRA adapter，传 `--limit 5` 就只跑 5 条做 smoke test。
+
+#### `MODEL_ARGS` 拼接逻辑
+
+##### 这段代码完整实现
+
+```bash
+MODEL_ARGS="pretrained=${MODEL},trust_remote_code=${TRUST_REMOTE_CODE},dtype=${DTYPE}"
+if [[ -n "${ADAPTER}" ]]; then
+  MODEL_ARGS="${MODEL_ARGS},peft=${ADAPTER}"
+fi
+```
+
+##### 解释
+
+`lm-evaluation-harness` 的 HF backend 通过 `--model_args` 接收模型参数。没有 adapter 时只加载 base model；有 adapter 时追加 `peft=...`，让 harness 加载 LoRA / QLoRA adapter。
+
+#### 命令数组构建逻辑
+
+##### 这段代码完整实现
+
+```bash
+CMD=(
+  "${LM_EVAL_BIN}" run
+  --model hf
+  --model_args "${MODEL_ARGS}"
+  --tasks "${TASKS}"
+  --device "${DEVICE}"
+  --batch_size "${BATCH_SIZE}"
+  --output_path "${OUTPUT_PATH}"
+)
+
+if [[ -n "${LIMIT}" ]]; then
+  CMD+=(--limit "${LIMIT}")
+fi
+
+if [[ "${LOG_SAMPLES}" == "true" ]]; then
+  CMD+=(--log_samples)
+fi
+```
+
+##### 为什么用数组
+
+Bash 数组能安全处理带空格或逗号的参数，避免字符串拼接导致参数被错误拆分。最后执行 `"${CMD[@]}"` 时，每个数组元素都是一个独立参数。
+
+### 17.7 `run_medicalgpt_sft_swanlab.sh`：SwanLab 训练启动脚本
+
+#### SwanLab 环境变量区域
+
+##### 这段代码完整实现
+
+```bash
+export SWANLAB_PROJ_NAME="${SWANLAB_PROJ_NAME:-MedSFT-Align}"
+export SWANLAB_EXP_NAME="${SWANLAB_EXP_NAME:-${RUN_NAME}}"
+export SWANLAB_TAGS="${SWANLAB_TAGS:-qwen3,sft,qlora,ceval-medical}"
+```
+
+##### 解释
+
+这几行设置 SwanLab 项目名、实验名和标签。如果外部已经设置了同名环境变量，就使用外部值；否则使用默认值。
+
+#### 训练数据存在性检查
+
+##### 这段代码完整实现
+
+```bash
+if [[ ! -f "${MEDICALGPT_DIR}/${TRAIN_FILE_DIR}/train.jsonl" ]]; then
+  cat >&2 <<EOF
+ERROR: Training file not found:
+  ${MEDICALGPT_DIR}/${TRAIN_FILE_DIR}/train.jsonl
+
+Create it first with:
+  cd ${MEDICALGPT_DIR}
+  mkdir -p ${TRAIN_FILE_DIR}
+  python tools/convert_dataset.py \\
+    --in_file ../data/sft/shibing624_medical_top100k.jsonl \\
+    --out_file ${TRAIN_FILE_DIR}/train.jsonl \\
+    --data_type alpaca \\
+    --file_type jsonl
+EOF
+  exit 1
+fi
+```
+
+##### 解释
+
+训练脚本默认读取 `MedicalGPT/data/sft_medsft_top100k/train.jsonl`。如果这个文件不存在，就提前报错，并提示如何转换数据。
+
+#### MedicalGPT 训练命令构建
+
+##### 这段代码完整实现
+
+```bash
+CMD=(
+  python training/supervised_finetuning.py
+  --model_name_or_path "${MODEL_NAME_OR_PATH}"
+  --train_file_dir "${TRAIN_FILE_DIR}"
+  --validation_file_dir "${VALIDATION_FILE_DIR}"
+  --do_train
+  --do_eval
+  --use_peft True
+  --max_train_samples "${MAX_TRAIN_SAMPLES}"
+  --max_eval_samples "${MAX_EVAL_SAMPLES}"
+  --model_max_length "${MODEL_MAX_LENGTH}"
+  --num_train_epochs "${NUM_TRAIN_EPOCHS}"
+  --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
+  --per_device_eval_batch_size "${PER_DEVICE_EVAL_BATCH_SIZE}"
+  --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
+  --learning_rate "${LEARNING_RATE}"
+  --warmup_ratio "${WARMUP_RATIO}"
+  --weight_decay 0.05
+  --logging_strategy steps
+  --logging_steps "${LOGGING_STEPS}"
+  --eval_strategy steps
+  --eval_steps "${EVAL_STEPS}"
+  --save_strategy steps
+  --save_steps "${SAVE_STEPS}"
+  --save_total_limit 3
+  --preprocessing_num_workers "${PREPROCESSING_NUM_WORKERS}"
+  --output_dir "${OUTPUT_DIR}"
+  --run_name "${RUN_NAME}"
+  --template_name qwen3
+  --target_modules "${TARGET_MODULES}"
+  --lora_rank "${LORA_RANK}"
+  --lora_alpha "${LORA_ALPHA}"
+  --lora_dropout "${LORA_DROPOUT}"
+  --torch_dtype "${TORCH_DTYPE}"
+  --bf16
+  --gradient_checkpointing True
+  --report_to swanlab
+)
+```
+
+##### 逐段解释
+
+- `python training/supervised_finetuning.py`：调用 MedicalGPT 的 SFT 入口。
+- `--model_name_or_path`：底座模型，默认 `Qwen/Qwen3-4B-Instruct`。
+- `--train_file_dir`：训练数据目录，默认 10 万 Top 数据。
+- `--validation_file_dir`：验证数据目录，默认同训练目录。
+- `--use_peft True`：启用 LoRA / PEFT。
+- `--template_name qwen3`：使用 Qwen3 对话模板。
+- `--target_modules`、`--lora_rank`、`--lora_alpha`、`--lora_dropout`：LoRA 配置。
+- `--gradient_checkpointing True`：用计算换显存。
+- `--report_to swanlab`：把 Trainer 日志上报 SwanLab。
+- `--run_name`：设置本次实验名。
+
+#### QLoRA 参数追加
+
+##### 这段代码完整实现
+
+```bash
+if [[ "${USE_QLORA}" == "true" ]]; then
+  CMD+=(--qlora True)
+fi
+
+if [[ "${LOAD_IN_4BIT}" == "true" ]]; then
+  CMD+=(--load_in_4bit True --optim paged_adamw_32bit)
+fi
+```
+
+##### 解释
+
+默认启用 QLoRA 和 4bit 加载。如果想跑普通 LoRA，可以在命令前设置：
+
+```bash
+USE_QLORA=false LOAD_IN_4BIT=false bash scripts/run_medicalgpt_sft_swanlab.sh
+```
+
+#### `--report_to swanlab` 和 `--run_name` 的作用
+
+`--report_to swanlab` 是接入 SwanLab 的核心参数。`--run_name` 用于区分不同实验，例如：
+
+```text
+qwen3-4b-medical-qlora-top100k
+qwen3-4b-medical-cleaned381k
+qwen3-4b-medical-swanlab-smoke
+```
+
+SwanLab 能自动记录训练 loss、eval loss、learning rate、epoch、step、运行时间、训练参数等 Hugging Face Trainer 上报的指标。
