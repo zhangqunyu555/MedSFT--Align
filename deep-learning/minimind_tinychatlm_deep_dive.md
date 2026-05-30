@@ -602,342 +602,1519 @@ Agent RL 中，模型会先生成 tool call，脚本执行工具，再把 tool r
 
 ## 5. 训练脚本代码详细解释
 
-### 5.1 公共训练组件
-
-很多训练脚本结构相似：
+这一章专门按“代码怎么跑”的顺序讲。每个训练脚本本质上都在回答同一组问题：
 
 ```text
+batch 从哪里来？
+batch 里每个字段是什么？
+哪些张量搬到 GPU？
+模型 forward 返回什么？
+loss 怎么构造？
+什么时候 backward？
+什么时候 optimizer.step？
+checkpoint 保存了什么？
+```
+
+如果能把这几个问题讲清楚，训练方法就不是抽象概念，而是能真正 debug 的代码路径。
+
+### 5.1 训练脚本通用执行骨架
+
+Pretrain、Full SFT、LoRA、DPO、PPO、GRPO 都遵循类似的主流程：
+
+```text
+argparse
 init_distributed_mode
 setup_seed
 MiniMindConfig
+lm_checkpoint(load resume)
+autocast / GradScaler
 init_model
-Dataset/DataLoader
-optimizer
-autocast
-forward
-loss.backward
-gradient clipping
-optimizer.step
-checkpoint
+Dataset / DataLoader
+optimizer / scheduler
+train_epoch
+save checkpoint
+destroy_process_group
 ```
 
-这些在 `trainer/trainer_utils.py` 中统一支持。
+#### 5.1.1 `argparse`：所有实验配置都从命令行进来
 
-#### DDP
-
-`init_distributed_mode` 根据环境变量 `RANK` 判断是否启用分布式。启用后使用 NCCL，并设置当前 GPU。
-
-#### 随机种子
-
-`setup_seed` 固定：
-
-- Python random
-- NumPy
-- PyTorch CPU
-- PyTorch CUDA
-- cuDNN deterministic
-
-目的是提升实验可复现性。
-
-#### 学习率
-
-`get_lr` 使用 cosine decay 风格：
-
-```text
-lr * (0.1 + 0.45 * (1 + cos(pi * step / total_steps)))
-```
-
-它会从初始学习率平滑下降到约 0.1 倍。
-
-#### checkpoint
-
-`lm_checkpoint` 保存两类东西：
-
-- 普通模型权重：用于推理和下游阶段加载。
-- resume 状态：包含 model、optimizer、epoch、step、world_size、wandb_id 等。
-
-权重命名与 hidden size、MoE 有关：
-
-```text
-<weight>_<hidden_size>.pth
-<weight>_<hidden_size>_moe.pth
-```
-
-所以如果 `hidden_size` 不一致，就会找错权重或加载失败。
-
-### 5.2 train_pretrain.py
-
-目标：从头训练基础语言模型。
-
-默认关键参数：
-
-| 参数 | 默认值 |
-| --- | --- |
-| `save_weight` | `pretrain` |
-| `from_weight` | `none` |
-| `learning_rate` | `5e-4` |
-| `batch_size` | 32 |
-| `accumulation_steps` | 8 |
-| `data_path` | `../dataset/pretrain_t2t_mini.jsonl` |
-
-核心 forward：
+每个训练脚本都有：
 
 ```python
-res = model(input_ids, labels=labels)
-loss = res.loss + res.aux_loss
-loss = loss / args.accumulation_steps
+parser = argparse.ArgumentParser(...)
+parser.add_argument("--save_dir", ...)
+parser.add_argument("--epochs", ...)
+parser.add_argument("--batch_size", ...)
+parser.add_argument("--learning_rate", ...)
+parser.add_argument("--hidden_size", ...)
+parser.add_argument("--num_hidden_layers", ...)
+parser.add_argument("--use_moe", ...)
+parser.add_argument("--data_path", ...)
+parser.add_argument("--from_weight", ...)
+args = parser.parse_args()
 ```
 
-`res.loss` 是 causal LM loss。`res.aux_loss` 是 MoE 辅助 loss，不开 MoE 时为 0。
-
-输出：`pretrain_768.pth`。
-
-容易踩坑：
-
-- 从根目录跑和从 trainer 目录跑，数据路径不同。
-- hidden size 必须和后续 SFT/eval 一致。
-
-### 5.3 train_full_sft.py
-
-目标：让模型学习对话格式和 assistant 回复。
-
-默认关键参数：
-
-| 参数 | 默认值 |
-| --- | --- |
-| `save_weight` | `full_sft` |
-| `from_weight` | `pretrain` |
-| `learning_rate` | `1e-5` |
-| `batch_size` | 16 |
-| `data_path` | `../dataset/sft_t2t_mini.jsonl` |
-
-代码结构和 pretrain 类似，但 Dataset 换成 `SFTDataset`。所以核心差别不在训练 loop，而在 labels：
+这意味着一次实验是否可复现，核心取决于命令行参数是否完整记录。尤其是：
 
 ```text
-PretrainDataset: 全文非 pad token 参与 loss
-SFTDataset: 只有 assistant 区间参与 loss
+hidden_size
+num_hidden_layers
+from_weight
+save_weight
+data_path
+use_moe
+dtype
+accumulation_steps
 ```
 
-输出：`full_sft_768.pth`。
+只要这些不一致，就可能出现参数量不一致、权重找不到、权重 shape 不匹配、loss 不可比等问题。
 
-### 5.4 train_lora.py
+#### 5.1.2 `init_distributed_mode()`：判断是否使用 DDP
 
-目标：冻结基座模型，只训练 LoRA adapter。
+代码逻辑是：
 
-LoRA 结构在 `model/model_lora.py`：
+```python
+if int(os.environ.get("RANK", -1)) == -1:
+    return 0
+
+dist.init_process_group(backend="nccl")
+local_rank = int(os.environ["LOCAL_RANK"])
+torch.cuda.set_device(local_rank)
+return local_rank
+```
+
+解释：
+
+- 如果环境变量里没有 `RANK`，说明不是 `torchrun` 启动，直接单卡/单进程训练。
+- 如果有 `RANK`，就初始化 NCCL 分布式进程组。
+- `LOCAL_RANK` 决定当前进程绑定哪张 GPU。
+
+训练脚本后面会根据它改写：
+
+```python
+if dist.is_initialized():
+    args.device = f"cuda:{local_rank}"
+```
+
+这就是为什么 DDP 启动时不能手动所有进程都用 `cuda:0`。
+
+#### 5.1.3 `setup_seed()`：固定随机性
+
+`setup_seed` 同时固定：
+
+```python
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+```
+
+作用：让数据 shuffle、参数初始化、dropout 等尽量可复现。
+
+注意：分布式训练里通常用：
+
+```python
+setup_seed(42 + dist.get_rank())
+```
+
+每个 rank 的 seed 稍有不同，避免所有卡采样完全一样。
+
+#### 5.1.4 `MiniMindConfig(...)`：决定模型结构
+
+训练脚本会创建：
+
+```python
+lm_config = MiniMindConfig(
+    hidden_size=args.hidden_size,
+    num_hidden_layers=args.num_hidden_layers,
+    use_moe=bool(args.use_moe)
+)
+```
+
+这个对象决定：
+
+- 模型维度。
+- 层数。
+- attention head 数。
+- GQA kv head 数。
+- 是否使用 MoE。
+- MoE expert 数和 aux loss 系数。
+
+所以 `hidden_size=512` 和 `hidden_size=768` 是两个不同结构的模型，不能混用权重。
+
+#### 5.1.5 `init_model()`：加载 tokenizer、构造模型、加载权重
+
+`init_model` 做三件事：
+
+```python
+tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+model = MiniMindForCausalLM(lm_config)
+```
+
+如果 `from_weight != 'none'`：
+
+```python
+weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+weights = torch.load(weight_path, map_location=device)
+model.load_state_dict(weights, strict=False)
+```
+
+解释：
+
+- `from_weight='none'`：从随机初始化开始，比如 pretrain。
+- `from_weight='pretrain'`：加载 `pretrain_768.pth`，比如 full_sft。
+- `from_weight='full_sft'`：加载 `full_sft_768.pth`，比如 LoRA/DPO/PPO/GRPO。
+- `moe_suffix='_moe'`：如果 `use_moe=True`，权重名会变成 `xxx_768_moe.pth`。
+
+这就是为什么路径、权重名前缀、hidden size、MoE 开关必须一致。
+
+#### 5.1.6 `autocast_ctx` 和 `GradScaler`：混合精度
+
+代码会根据设备和 dtype 设置：
+
+```python
+device_type = "cuda" if "cuda" in args.device else "cpu"
+dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
+```
+
+解释：
+
+- bf16 用 autocast，但通常不需要 GradScaler。
+- fp16 动态范围更窄，需要 GradScaler 防止梯度下溢。
+- CPU 不使用 CUDA autocast，所以走 `nullcontext()`。
+
+训练时一般是：
+
+```python
+with autocast_ctx:
+    res = model(...)
+    loss = ...
+scaler.scale(loss).backward()
+```
+
+#### 5.1.7 `SkipBatchSampler`：resume 时跳过已训练 batch
+
+如果中断训练，resume 文件里会记录：
+
+```text
+epoch
+step
+optimizer
+scaler
+```
+
+恢复时，代码用：
+
+```python
+skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+```
+
+`SkipBatchSampler` 会在当前 epoch 跳过前 `skip_batches` 个 batch，从中断位置继续训练。
+
+#### 5.1.8 `lm_checkpoint()`：保存推理权重和 resume 状态
+
+保存模型时有两类文件：
+
+```text
+../out/<weight>_<hidden_size>.pth
+../checkpoints/<weight>_<hidden_size>_resume.pth
+```
+
+普通权重只保存模型参数，方便下游加载。resume 权重还保存：
+
+```python
+{
+    "model": state_dict,
+    "optimizer": optimizer.state_dict(),
+    "epoch": epoch,
+    "step": step,
+    "world_size": ...,
+    "wandb_id": ...
+}
+```
+
+PPO 还会额外保存 critic、scheduler 等状态。
+
+### 5.2 Pretrain 和 Full SFT：`train_epoch` 逐行解释
+
+`train_pretrain.py::train_epoch` 和 `train_full_sft.py::train_epoch` 几乎一样，核心差别是 Dataset：
+
+```text
+PretrainDataset -> labels 覆盖全文非 pad token
+SFTDataset -> labels 只覆盖 assistant 区间
+```
+
+也就是说：训练 loop 相同，但任务语义由 labels 决定。
+
+#### 5.2.1 batch 输入
+
+DataLoader 每次返回：
+
+```python
+for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+```
+
+张量形状通常是：
+
+```text
+input_ids: [B, T]
+labels:    [B, T]
+```
+
+其中：
+
+- `B` 是 batch size。
+- `T` 是 max sequence length。
+- `input_ids` 是模型输入。
+- `labels` 是训练目标，不参与 loss 的位置为 `-100`。
+
+#### 5.2.2 搬到 GPU
+
+```python
+input_ids = input_ids.to(args.device)
+labels = labels.to(args.device)
+```
+
+DataLoader 读出来的张量默认在 CPU。模型在 GPU 上，所以 batch 也必须搬到同一个 device。
+
+如果忘记这一步，会报 device mismatch：
+
+```text
+Expected all tensors to be on the same device
+```
+
+#### 5.2.3 动态调整学习率
+
+```python
+lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+for param_group in optimizer.param_groups:
+    param_group['lr'] = lr
+```
+
+解释：
+
+- `epoch * iters + step` 是全局 step。
+- `args.epochs * iters` 是总 step。
+- `get_lr` 返回 cosine decay 后的学习率。
+- 遍历 `param_groups` 是因为 optimizer 可能有多个参数组。
+
+#### 5.2.4 forward 和 loss
+
+```python
+with autocast_ctx:
+    res = model(input_ids, labels=labels)
+    loss = res.loss + res.aux_loss
+    loss = loss / args.accumulation_steps
+```
+
+`model(input_ids, labels=labels)` 会进入 `MiniMindForCausalLM.forward`：
+
+```python
+hidden_states, past_key_values, aux_loss = self.model(...)
+logits = self.lm_head(hidden_states)
+loss = cross_entropy(logits[..., :-1, :], labels[..., 1:], ignore_index=-100)
+```
+
+关键点：
+
+- `res.loss` 是 next-token prediction CE loss。
+- `ignore_index=-100` 会忽略 Dataset mask 掉的位置。
+- `res.aux_loss` 是 MoE 辅助 loss，Dense 模型时为 0。
+- 除以 `accumulation_steps` 是为了梯度累积时保持总梯度尺度不变。
+
+#### 5.2.5 backward
+
+```python
+scaler.scale(loss).backward()
+```
+
+如果 dtype 是 fp16，GradScaler 会把 loss 放大再反传，避免梯度太小下溢。如果是 bf16，scaler disabled，本质上等价普通 backward。
+
+#### 5.2.6 梯度累积和 optimizer step
+
+```python
+if step % args.accumulation_steps == 0:
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
+```
+
+解释：
+
+- 每个 micro-batch 都 backward。
+- 每 `accumulation_steps` 个 micro-batch 才更新一次参数。
+- `unscale_` 后才能正确做梯度裁剪。
+- `clip_grad_norm_` 防止梯度爆炸。
+- `zero_grad(set_to_none=True)` 更省显存。
+
+如果 epoch 结束时还有不足一个 accumulation 的残留 batch，代码会在循环后再补一次 step。
+
+#### 5.2.7 日志
+
+```python
+current_loss = loss.item() * args.accumulation_steps
+current_aux_loss = res.aux_loss.item()
+current_logits_loss = current_loss - current_aux_loss
+```
+
+因为训练时 loss 除过 `accumulation_steps`，日志里乘回来，显示真实 batch loss。
+
+记录指标：
+
+```text
+loss
+logits_loss
+aux_loss
+learning_rate
+epoch_time
+```
+
+#### 5.2.8 checkpoint
+
+```python
+if (step % args.save_interval == 0 or step == iters) and is_main_process():
+    model.eval()
+    state_dict = raw_model.state_dict()
+    torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
+    lm_checkpoint(...)
+    model.train()
+```
+
+解释：
+
+- 只在 main process 保存，避免多卡同时写文件。
+- 保存前 `model.eval()`，保存后切回 `model.train()`。
+- 权重转 half/cpu，减少磁盘占用。
+- `lm_checkpoint` 额外保存 resume 状态。
+
+#### 5.2.9 Pretrain 和 SFT 到底差在哪
+
+Pretrain 的 Dataset：
+
+```text
+labels = input_ids.clone()
+labels[pad] = -100
+```
+
+所以几乎全文都参与 loss。
+
+SFT 的 Dataset：
+
+```text
+labels 默认全是 -100
+只把 assistant 区间设为真实 token id
+```
+
+所以训练 loop 虽然一样，但优化目标完全不同：
+
+```text
+Pretrain: 学文本续写
+SFT: 学看到用户问题后如何生成 assistant 回答
+```
+
+### 5.3 LoRA SFT：从 adapter 到训练 loop
+
+LoRA 相关代码在 `model/model_lora.py` 和 `trainer/train_lora.py`。
+
+#### 5.3.1 `LoRA.forward()` 为什么是 `B(A(x))`
+
+代码结构：
 
 ```python
 class LoRA(nn.Module):
-    A = Linear(in_features, rank)
-    B = Linear(rank, out_features)
+    def __init__(self, in_features, out_features, rank):
+        self.A = nn.Linear(in_features, rank, bias=False)
+        self.B = nn.Linear(rank, out_features, bias=False)
+
+    def forward(self, x):
+        return self.B(self.A(x))
 ```
 
-初始化：
+原始线性层是：
 
 ```text
-A 高斯初始化
-B 零初始化
+y = W x
 ```
 
-为什么 B 要零初始化？因为训练开始时：
+LoRA 加的是低秩增量：
 
 ```text
-B(Ax)=0
+y = W x + B(Ax)
 ```
 
-模型输出和原 full_sft 完全一致，不会一开始就破坏基座能力。
+其中：
 
-`apply_lora` 会给部分 `nn.Linear` 增加 `lora` 分支，并 monkey-patch forward：
+- `A` 把高维输入压到 rank 维。
+- `B` 再把 rank 维投回输出维。
+- `B @ A` 的矩阵秩最多是 rank。
+
+所以 LoRA 参数量是：
+
+```text
+in_features * rank + rank * out_features
+```
+
+远小于完整 `in_features * out_features`。
+
+#### 5.3.2 A 高斯初始化，B 零初始化
+
+代码里：
 
 ```python
-return original_linear(x) + lora(x)
+self.A.weight.data.normal_(mean=0.0, std=0.02)
+self.B.weight.data.zero_()
 ```
 
-然后冻结非 LoRA 参数：
+因为 B 是 0，所以训练一开始：
 
 ```text
-if 'lora' in name: requires_grad=True
-else: requires_grad=False
+B(Ax) = 0
 ```
 
-保存时只保存 LoRA 权重：
+这意味着刚注入 LoRA 时模型输出不变。这样不会破坏 `full_sft` 已有能力。
 
-```text
-save_lora
-```
+#### 5.3.3 `apply_lora()` 如何 monkey-patch forward
 
-部署或导出时可以合并：
-
-```text
-W = W + B @ A
-```
-
-推荐路线：
-
-```text
-pretrain -> full_sft -> lora_sft
-```
-
-### 5.5 train_dpo.py
-
-目标：用 chosen/rejected 偏好数据做离线对齐。
-
-两个模型：
-
-```text
-policy model: 可训练
-reference model: 冻结
-```
-
-输入来自 `DPODataset`：
-
-```text
-x_chosen, y_chosen, mask_chosen
-x_rejected, y_rejected, mask_rejected
-```
-
-训练脚本拼接：
+核心代码逻辑：
 
 ```python
-x = cat([x_chosen, x_rejected])
-y = cat([y_chosen, y_rejected])
-mask = cat([mask_chosen, mask_rejected])
+for name, module in model.named_modules():
+    if isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]:
+        lora = LoRA(...).to(model.device)
+        setattr(module, "lora", lora)
+        original_forward = module.forward
+
+        def forward_with_lora(x, layer1=original_forward, layer2=lora):
+            return layer1(x) + layer2(x)
+
+        module.forward = forward_with_lora
 ```
 
-`logits_to_log_probs` 做：
+逐句解释：
 
-```text
-log_softmax(logits)
-gather(labels)
+- `model.named_modules()` 遍历模型中所有子模块。
+- `isinstance(module, nn.Linear)` 只处理线性层。
+- `module.weight.shape[0] == module.weight.shape[1]` 表示只给方阵线性层加 LoRA。
+- `setattr(module, "lora", lora)` 把 LoRA 模块挂到原 Linear 上。
+- `original_forward = module.forward` 保存原来的线性层计算。
+- 新的 `forward_with_lora` 返回原输出加 LoRA 输出。
+- `module.forward = forward_with_lora` 直接替换模块 forward。
+
+这叫 monkey-patch。好处是实现简单；缺点是和 `torch.compile` 不兼容，所以脚本里会自动关闭 compile。
+
+#### 5.3.4 只训练 LoRA 参数
+
+`train_lora.py` 里：
+
+```python
+lora_params = []
+for name, param in model.named_parameters():
+    if 'lora' in name:
+        param.requires_grad = True
+        lora_params.append(param)
+    else:
+        param.requires_grad = False
 ```
 
-然后按 mask 求和得到每个 response 的 log probability。
+然后 optimizer 只拿 LoRA 参数：
 
-DPO loss：
+```python
+optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
+```
+
+所以 backward 时虽然整个模型参与 forward，但只有 LoRA 参数会产生可更新梯度。
+
+训练 step 里裁剪的也是：
+
+```python
+clip_grad_norm_(lora_params, args.grad_clip)
+```
+
+这就是真正的参数高效微调。
+
+#### 5.3.5 `save_lora()` 只保存 adapter
+
+核心逻辑：
+
+```python
+for name, module in raw_model.named_modules():
+    if hasattr(module, 'lora'):
+        lora_state = {
+            f'{clean_name}.lora.{k}': v.cpu().half()
+            for k, v in module.lora.state_dict().items()
+        }
+        state_dict.update(lora_state)
+torch.save(state_dict, path)
+```
+
+只保存 `.lora.` 里的 A/B 参数，不保存完整模型，所以文件小。
+
+#### 5.3.6 `load_lora()` 如何加载
+
+`load_lora` 会从 checkpoint 中筛选当前模块对应的 key：
+
+```python
+lora_state = {
+    k.replace(f'{name}.lora.', ''): v
+    for k, v in state_dict.items()
+    if f'{name}.lora.' in k
+}
+module.lora.load_state_dict(lora_state)
+```
+
+前提：模型已经先执行过 `apply_lora()`，否则模块上没有 `module.lora`。
+
+#### 5.3.7 `merge_lora()` 如何合并
+
+核心：
+
+```python
+state_dict[f'{name}.weight'] = module.weight.data.clone()
+state_dict[f'{name}.weight'] += module.lora.B.weight.data @ module.lora.A.weight.data
+```
+
+因为 LoRA 增量就是：
 
 ```text
-pi_logratios = chosen_policy_logp - rejected_policy_logp
-ref_logratios = chosen_ref_logp - rejected_ref_logp
+delta_W = B @ A
+```
+
+合并后，推理时不需要额外 lora 分支：
+
+```text
+W_merged = W + delta_W
+```
+
+### 5.4 DPO：从 logprob 到偏好 loss
+
+DPO 代码主要在 `trainer/train_dpo.py`。
+
+#### 5.4.1 `logits_to_log_probs(logits, labels)`
+
+输入：
+
+```text
+logits: [B, T, V]
+labels: [B, T]
+```
+
+其中：
+
+- `B` 是 batch size。
+- `T` 是序列长度。
+- `V` 是 vocab size。
+
+代码：
+
+```python
+log_probs = F.log_softmax(logits, dim=2)
+log_probs_per_token = torch.gather(
+    log_probs,
+    dim=2,
+    index=labels.unsqueeze(2)
+).squeeze(-1)
+```
+
+解释：
+
+- `log_softmax(logits, dim=2)` 把每个位置的 vocab logits 变成 log probability。
+- `labels.unsqueeze(2)` 让 labels 从 `[B, T]` 变成 `[B, T, 1]`。
+- `gather(dim=2, index=...)` 取出目标 token 对应的 log probability。
+- 输出是 `[B, T]`，每个位置一个 logp。
+
+#### 5.4.2 `dpo_loss(ref_log_probs, policy_log_probs, mask, beta)`
+
+第一步：只保留 assistant answer 部分：
+
+```python
+ref_log_probs = (ref_log_probs * mask).sum(dim=1)
+policy_log_probs = (policy_log_probs * mask).sum(dim=1)
+```
+
+这里：
+
+```text
+mask: [B, T]
+```
+
+mask 为 1 的位置是回答 token，mask 为 0 的位置是 prompt/pad。
+
+第二步：把 batch 分成 chosen 和 rejected：
+
+```python
+batch_size = ref_log_probs.shape[0]
+chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
+reject_ref_log_probs = ref_log_probs[batch_size // 2:]
+chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
+reject_policy_log_probs = policy_log_probs[batch_size // 2:]
+```
+
+这是因为 `train_epoch` 里拼 batch 时写的是：
+
+```python
+x = torch.cat([x_chosen, x_rejected], dim=0)
+```
+
+所以前半是 chosen，后半是 rejected。
+
+第三步：计算 policy 和 reference 的偏好 margin：
+
+```python
+pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
+ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
 logits = pi_logratios - ref_logratios
-loss = -logsigmoid(beta * logits)
 ```
 
-直观理解：
+含义：
 
-```text
-如果 policy 比 reference 更偏向 chosen，loss 变小。
-如果 policy 仍偏向 rejected，loss 变大。
-```
+- `pi_logratios`：policy 对 chosen 相比 rejected 的偏好程度。
+- `ref_logratios`：reference 对 chosen 相比 rejected 的偏好程度。
+- `logits`：policy 比 reference 多出来的偏好提升。
 
-默认学习率很小：
-
-```text
-4e-8
-```
-
-原因是 DPO 容易让模型偏离 SFT 能力，低学习率可以降低遗忘风险。
-
-### 5.6 train_ppo.py
-
-目标：在线生成回答，用 reward model 评分，再用 PPO 更新策略。
-
-PPO 有四个角色：
-
-| 角色 | 作用 |
-| --- | --- |
-| actor | 当前策略模型，负责生成 |
-| critic | 估计 value |
-| reference | 冻结基线，控制 KL |
-| reward model | 给回答打分 |
-
-流程：
-
-1. 从 `RLAIFDataset` 取 prompt。
-2. rollout engine 生成 response。
-3. `calculate_rewards` 用规则和 reward model 打分。
-4. actor 计算 old logp。
-5. critic 计算 old value。
-6. reference 计算 ref logp。
-7. 用 GAE 算 advantage。
-8. PPO 多轮更新 actor/critic。
-
-PPO 的核心是 clipped objective：
-
-```text
-ratio = exp(new_logp - old_logp)
-policy_loss = max(-adv * ratio, -adv * clip(ratio))
-```
-
-还会加入 reference KL penalty，避免 policy 偏离太远。
-
-你观察到 reward 多为负、生成长度到上限，说明：
-
-- reward model 对回答质量不满意。
-- 模型 eos/停止能力不稳定。
-- RL 阶段还需要调 max_gen_len、KL、学习率和 reward。
-
-### 5.7 train_grpo.py
-
-目标：不用 critic，也做在线强化对齐。
-
-GRPO 做法：
-
-```text
-对每个 prompt 生成 num_generations 条回答
-计算每条 reward
-组内标准化 reward 得到 advantage
-```
-
-公式直观是：
-
-```text
-advantage = (reward - group_mean) / (group_std + eps)
-```
-
-这样不需要 critic 估计 baseline。
-
-代码支持两种 loss：
-
-```text
-loss_type = grpo
-loss_type = cispo
-```
-
-默认是 `cispo`，会对 ratio 做上界截断，降低异常大更新。
-
-你观察到 actor loss 接近 0，可能原因：
-
-- 学习率太小。
-- reward 都偏低且区分度不足。
-- 组内 reward 方差不够。
-- clipping 或 CISPO 截断导致更新弱。
-
-### 5.8 rollout_engine.py
-
-rollout engine 是 RL 阶段生成回答的抽象层。
-
-`TorchRolloutEngine`：
-
-- 直接调用当前 PyTorch policy model 的 `generate`。
-- 简单，不依赖外部服务。
-- 吞吐可能较低。
-
-`SGLangRolloutEngine`：
-
-- 通过 HTTP 调 SGLang 服务。
-- 可以让推理引擎负责 rollout。
-- 支持 `update_weights_from_disk` 动态更新策略权重。
-
-统一返回：
+第四步：DPO loss：
 
 ```python
-RolloutResult(
-    output_ids,
-    completion_ids,
-    per_token_logps,
-    completions
+loss = -F.logsigmoid(beta * logits)
+return loss.mean()
+```
+
+如果 policy 已经比 reference 更偏 chosen，`logits` 大，`logsigmoid` 接近 0，loss 小。
+
+#### 5.4.3 `train_dpo.py::train_epoch`
+
+batch 字段：
+
+```python
+x_chosen = batch['x_chosen'].to(args.device)
+x_rejected = batch['x_rejected'].to(args.device)
+y_chosen = batch['y_chosen'].to(args.device)
+y_rejected = batch['y_rejected'].to(args.device)
+mask_chosen = batch['mask_chosen'].to(args.device)
+mask_rejected = batch['mask_rejected'].to(args.device)
+```
+
+拼接：
+
+```python
+x = torch.cat([x_chosen, x_rejected], dim=0)
+y = torch.cat([y_chosen, y_rejected], dim=0)
+mask = torch.cat([mask_chosen, mask_rejected], dim=0)
+```
+
+reference forward：
+
+```python
+with torch.no_grad():
+    ref_outputs = ref_model(x)
+    ref_logits = ref_outputs.logits
+ref_log_probs = logits_to_log_probs(ref_logits, y)
+```
+
+为什么 `torch.no_grad()`？reference model 是冻结基线，不需要梯度，省显存，也防止被更新。
+
+policy forward：
+
+```python
+outputs = model(x)
+logits = outputs.logits
+policy_log_probs = logits_to_log_probs(logits, y)
+```
+
+policy 是要训练的，所以不能 no_grad。
+
+loss：
+
+```python
+dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
+loss = dpo_loss_val + outputs.aux_loss
+loss = loss / args.accumulation_steps
+```
+
+如果是 MoE，`outputs.aux_loss` 保持 expert 负载均衡；Dense 模型时基本为 0。
+
+后面的 backward、clip、step、save 和 Pretrain/SFT 一样。
+
+### 5.5 PPO：actor-critic 的在线强化对齐
+
+PPO 代码在 `trainer/train_ppo.py`，核心函数是 `ppo_train_epoch`。
+
+#### 5.5.1 `CriticModel`
+
+代码：
+
+```python
+class CriticModel(MiniMindForCausalLM):
+    def __init__(self, params):
+        super().__init__(params)
+        self.value_head = nn.Linear(params.hidden_size, 1)
+
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+        hidden_states = self.model.norm(outputs[0])
+        values = self.value_head(hidden_states).squeeze(-1)
+        return values
+```
+
+解释：
+
+- Critic 复用 MiniMind backbone。
+- 不用 `lm_head` 预测 token，而是用 `value_head` 输出每个 token 的 value。
+- 输出形状是 `[B, T]`，表示每个位置的价值估计。
+
+#### 5.5.2 `calculate_rewards()`
+
+PPO reward 由规则奖励和 reward model 组成。
+
+长度奖励：
+
+```python
+rewards[i] += 0.5 if 20 <= len(response.strip()) <= 800 else -0.5
+```
+
+thinking 格式奖励：
+
+```python
+if '</think>' in response:
+    thinking_content, answer_content = response.split('</think>', 1)
+    rewards[i] += 1.0 if 20 <= len(thinking_content.strip()) <= 300 else -0.5
+    rewards[i] += 0.25 if response.count('</think>') == 1 else -0.25
+```
+
+重复惩罚：
+
+```python
+rewards[i] -= rep_penalty(answer)
+```
+
+reward model 分数：
+
+```python
+score = reward_model.get_score(messages, answer)
+rewards += reward_model_scores
+```
+
+所以 PPO 优化目标不只是“像参考答案”，而是综合长度、格式、重复度和外部 RM 打分。
+
+#### 5.5.3 `ppo_train_epoch` 第一步：prompt tokenize 和 rollout
+
+输入 batch：
+
+```python
+prompts = batch["prompt"]
+```
+
+tokenize：
+
+```python
+enc = tokenizer(
+    prompts,
+    return_tensors="pt",
+    padding=True,
+    truncation=True,
+    max_length=args.max_seq_len,
+    padding_side="left"
+).to(args.device)
+prompt_length = enc.input_ids.shape[1]
+```
+
+这里 `prompt_length=P`。因为 left padding，batch 内 prompt 会 pad 到同一长度。
+
+rollout：
+
+```python
+rollout_result = rollout_engine.rollout(
+    prompt_ids=enc.input_ids,
+    attention_mask=enc.attention_mask,
+    num_generations=1,
+    max_new_tokens=args.max_gen_len,
+    temperature=0.8,
+)
+gen_out = rollout_result.output_ids
+responses_text = rollout_result.completions
+```
+
+张量形状：
+
+```text
+gen_out: [B, P+R]
+```
+
+其中 `P` 是 prompt 长度，`R` 是生成长度。
+
+#### 5.5.4 labels、mask 和 response 区间
+
+代码：
+
+```python
+full_mask = (gen_out != tokenizer.pad_token_id).long()
+labels = gen_out[:, 1:].clone()
+seq_len, resp_start = gen_out.size(1) - 1, prompt_length - 1
+```
+
+解释：
+
+- `labels` 是 next-token prediction 的目标，长度是 `P+R-1`。
+- `resp_start = prompt_length - 1`，因为 logits 的第 `prompt_length-1` 个位置预测第一个 response token。
+
+构造 response mask：
+
+```python
+resp_mask = torch.arange(seq_len).unsqueeze(0) >= resp_start
+final_mask = resp_mask & (~labels.eq(pad_id))
+```
+
+后面又根据 eos 重新算 response 有效长度：
+
+```python
+resp_labels = labels[:, resp_start:]
+resp_pad_mask = ~resp_labels.eq(pad_id)
+eos_mask = resp_labels.eq(eos_id) & resp_pad_mask
+resp_lengths = eos_pos + 1 if has_eos else pad_mask.sum
+resp_policy_mask = (resp_idx < resp_lengths) & resp_pad_mask
+```
+
+形状：
+
+```text
+resp_labels:      [B, R]
+resp_policy_mask: [B, R]
+resp_lengths:     [B]
+```
+
+`resp_policy_mask` 决定 PPO loss 只算 response 的有效 token，eos 后和 pad 不参与训练。
+
+#### 5.5.5 old value、old logp、reference logp
+
+这些都在 `torch.no_grad()` 下算，因为 rollout 阶段只是收集旧策略数据。
+
+critic old value：
+
+```python
+values_seq = critic_for_rollout(input_ids=gen_out, attention_mask=full_mask)
+old_resp_values = values_seq[:, resp_start:-1] * resp_value_mask
+```
+
+形状：
+
+```text
+values_seq:       [B, P+R]
+old_resp_values:  [B, R]
+```
+
+actor old logp：
+
+```python
+logits = actor_for_rollout(input_ids=gen_out, attention_mask=full_mask).logits
+old_resp_logp = log_softmax(logits[:, :-1]).gather(labels)[:, resp_start:]
+```
+
+形状：
+
+```text
+old_resp_logp: [B, R]
+```
+
+reference logp：
+
+```python
+ref_logp_all = log_softmax(ref_model(...).logits[:, :-1]).gather(labels)
+ref_resp_logp = ref_logp_all[:, resp_start:]
+```
+
+reference 用来计算 KL penalty，控制 policy 不要偏离 SFT 太远。
+
+#### 5.5.6 token reward 和 GAE
+
+外部 reward 是 response 级别的：
+
+```text
+rewards: [B]
+```
+
+代码把它加到每条 response 的最后有效 token：
+
+```python
+token_rewards = torch.zeros_like(old_resp_logp)
+last_idx = resp_lengths - 1
+token_rewards[torch.arange(B), last_idx] += rewards
+```
+
+然后反向递推 GAE：
+
+```python
+lastgaelam = 0
+for t in reversed(range(gen_len)):
+    nv = old_resp_values[:, t + 1] if t < gen_len - 1 else 0.0
+    delta = token_rewards[:, t] + gamma * nv - old_resp_values[:, t]
+    lastgaelam = delta + gamma * lam * lastgaelam
+    advs_rev.append(lastgaelam)
+advantages = stack(reverse(advs_rev))
+returns = advantages + old_resp_values
+```
+
+含义：
+
+- `advantages`: 当前 token 的动作比 critic 预期好多少。
+- `returns`: value head 应该回归的目标。
+
+然后标准化 advantage：
+
+```python
+adv_mean = masked_mean(advantages)
+adv_var = masked_var(advantages)
+advantages = (advantages - adv_mean) / sqrt(adv_var + 1e-8)
+```
+
+这能让 PPO 更新更稳定。
+
+#### 5.5.7 PPO minibatch 更新
+
+PPO 对同一批 rollout 做多轮更新：
+
+```python
+for ppo_epoch in range(args.ppo_update_iters):
+    b_inds = torch.randperm(B)
+    for i in range(0, B, mb_size):
+        inds = b_inds[i:i + mb_size]
+```
+
+重新计算当前 policy logp：
+
+```python
+res = actor_unwrapped(input_ids=gen_out[inds], attention_mask=full_mask[inds])
+mb_logp_all = log_softmax(res.logits[:, :-1]).gather(labels[inds])
+mb_resp_logp = mb_logp_all[:, resp_start:]
+```
+
+计算 ratio：
+
+```python
+log_ratio = mb_resp_logp - old_resp_logp[inds]
+ratio = torch.exp(log_ratio)
+```
+
+`ratio` 表示新策略相对旧策略在同一个 token 上的概率变化。
+
+approx KL：
+
+```python
+approx_kl = 0.5 * (log_ratio ** 2)
+```
+
+如果 KL 太大：
+
+```python
+if approx_kl_val > args.early_stop_kl:
+    stop_ppo = True
+```
+
+这避免 policy 一步偏离太远。
+
+clip fraction：
+
+```python
+clipfrac = ((ratio - 1).abs() > clip_epsilon).mean()
+```
+
+它表示有多少 token 的 ratio 超过裁剪范围。
+
+reference KL penalty：
+
+```python
+kl_ref_penalty = exp(ref_logp - mb_logp) - (ref_logp - mb_logp) - 1
+```
+
+这是一个非负形式的 KL 近似，用来约束 policy 不要离 reference 太远。
+
+policy loss：
+
+```python
+policy_loss = max(
+    -adv * ratio,
+    -adv * clamp(ratio, 1-eps, 1+eps)
+) + kl_coef * kl_ref_penalty
+```
+
+value loss：
+
+```python
+value_loss = 0.5 * max(
+    (new_value - returns)^2,
+    (clamp(new_value, old_value - clip, old_value + clip) - returns)^2
 )
 ```
+
+总 loss：
+
+```python
+loss = policy_loss + vf_coef * value_loss + aux_loss
+```
+
+如果 early stop，为了避免 DDP 通信死锁，代码不是直接 break，而是让 loss 乘 0，保证 forward-backward 闭环还存在。
+
+#### 5.5.8 actor/critic 更新
+
+```python
+loss.backward()
+clip_grad_norm_(actor_model.parameters(), args.grad_clip)
+clip_grad_norm_(critic_model.parameters(), args.grad_clip)
+actor_optimizer.step()
+critic_optimizer.step()
+actor_scheduler.step()
+critic_scheduler.step()
+actor_optimizer.zero_grad()
+critic_optimizer.zero_grad()
+```
+
+PPO 同时更新 actor 和 critic：
+
+- actor 学“怎么生成更高 reward 的 token”。
+- critic 学“当前状态的 value 应该是多少”。
+
+#### 5.5.9 PPO checkpoint
+
+保存时：
+
+```python
+torch.save(actor_state, ppo_actor_768.pth)
+lm_checkpoint(..., critic_model=critic_model, critic_optimizer=critic_optimizer, ...)
+```
+
+普通推理主要用 actor 权重。resume 需要同时恢复 critic、两个 optimizer、两个 scheduler。
+
+### 5.6 GRPO：无 critic 的组内相对优化
+
+GRPO 代码在 `trainer/train_grpo.py`，核心函数是 `grpo_train_epoch`。
+
+#### 5.6.1 `calculate_rewards()` 如何处理多 generation
+
+GRPO 对每个 prompt 生成 `num_generations` 条回答。假设：
+
+```text
+B = prompt 数量
+G = num_generations
+```
+
+responses 的长度是：
+
+```text
+B * G
+```
+
+代码通过：
+
+```python
+for i in range(batch_size):
+    for j in range(args.num_generations):
+        response_idx = i * args.num_generations + j
+```
+
+找到第 i 个 prompt 的第 j 个回答。
+
+每条回答同样计算：
+
+- 长度奖励。
+- thinking 标签奖励。
+- 重复惩罚。
+- reward model 分数。
+
+输出：
+
+```text
+rewards: [B * G]
+```
+
+#### 5.6.2 prompt tokenize 和左截断
+
+```python
+prompt_inputs = tokenizer(
+    prompts,
+    return_tensors="pt",
+    padding=True,
+    return_token_type_ids=False,
+    padding_side="left",
+    add_special_tokens=False
+).to(args.device)
+```
+
+如果超过最大 prompt 长度：
+
+```python
+prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -args.max_seq_len:]
+prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -args.max_seq_len:]
+```
+
+左截断保留最后的上下文，因为最近的 user query 通常最重要。
+
+#### 5.6.3 rollout 一次生成 `B * G` 条 completion
+
+```python
+rollout_result = rollout_engine.rollout(
+    prompt_ids=prompt_inputs["input_ids"],
+    attention_mask=prompt_inputs["attention_mask"],
+    num_generations=args.num_generations,
+    max_new_tokens=args.max_gen_len,
+    temperature=0.8,
+)
+```
+
+返回：
+
+```text
+outputs:            [B*G, P+R]
+completion_ids:     [B*G, R]
+completions:        list[str], length B*G
+old_per_token_logps:[B*G, R]
+```
+
+`old_per_token_logps` 是 rollout 时旧策略生成这些 token 的 logprob，是计算 ratio 的基准。
+
+#### 5.6.4 当前 policy logp 和 reference logp
+
+如果使用 SGLang 或 MoE，代码重新 forward 当前模型：
+
+```python
+res = model_unwrapped(outputs)
+logits = res.logits[:, :-1, :]
+per_token_logps = log_softmax(logits).gather(outputs[:, 1:])
+per_token_logps = per_token_logps[:, -completion_ids.size(1):]
+```
+
+只取 completion 的后 R 个 token logp。
+
+reference logp：
+
+```python
+ref_per_token_logps = compute_per_token_logps(ref_model, outputs, completion_ids.size(1))
+```
+
+形状都是：
+
+```text
+[B*G, R]
+```
+
+#### 5.6.5 组内 reward 标准化
+
+```python
+grouped_rewards = rewards.view(-1, args.num_generations)
+mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)
+std_r = grouped_rewards.std(dim=1).repeat_interleave(args.num_generations)
+advantages = (rewards - mean_r) / (std_r + 1e-4)
+```
+
+形状：
+
+```text
+grouped_rewards: [B, G]
+advantages:      [B*G]
+```
+
+这就是 GRPO 不需要 critic 的原因：同一个 prompt 下多条回答互相比较，组内均值就是 baseline。
+
+#### 5.6.6 `completion_mask` 排除 eos 后 token
+
+```python
+is_eos = completion_ids == tokenizer.eos_token_id
+eos_idx = ...
+completion_mask = arange(R) <= eos_idx
+```
+
+如果某条回答提前出现 eos，eos 后面的 pad 或无效 token 不参与 loss。
+
+形状：
+
+```text
+completion_mask: [B*G, R]
+```
+
+#### 5.6.7 KL 和 ratio
+
+```python
+kl_div = ref_per_token_logps - per_token_logps
+per_token_kl = torch.exp(kl_div) - kl_div - 1
+ratio = torch.exp(per_token_logps - old_per_token_logps)
+```
+
+解释：
+
+- `per_token_kl` 控制当前 policy 不要离 reference 太远。
+- `ratio` 比较当前 policy 和 rollout 旧 policy 对同一 token 的概率变化。
+
+#### 5.6.8 GRPO loss 和 CISPO loss
+
+GRPO 分支：
+
+```python
+clipped_ratio = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
+per_token_loss1 = ratio * advantages
+per_token_loss2 = clipped_ratio * advantages
+per_token_loss = -(min(loss1, loss2) - beta * per_token_kl)
+```
+
+这是 PPO-style clip。
+
+CISPO 分支：
+
+```python
+clamped_ratio = torch.clamp(ratio, max=epsilon_high).detach()
+per_token_loss = -(clamped_ratio * advantages * per_token_logps - beta * per_token_kl)
+```
+
+区别：
+
+- GRPO 用 ratio 和 clipped ratio 取 min。
+- CISPO 对 ratio 设上界，并 detach，减少异常大 ratio 带来的不稳定。
+
+最后：
+
+```python
+policy_loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+loss = (policy_loss + aux_loss) / accumulation_steps
+```
+
+#### 5.6.9 更新与 rollout policy 同步
+
+```python
+loss.backward()
+if step % accumulation_steps == 0:
+    clip_grad_norm_(model.parameters(), grad_clip)
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad()
+    rollout_engine.update_policy(model)
+```
+
+如果 rollout engine 是 SGLang，`update_policy` 会把新权重保存到共享路径，并通知 SGLang 服务重新加载。
+
+#### 5.6.10 actor loss 接近 0 怎么排查
+
+从代码变量看：
+
+- `rewards` 是否都差不多，导致 `advantages` 很小。
+- `std_r` 是否过小，组内没有区分度。
+- `learning_rate` 是否太低。
+- `ratio` 是否接近 1，说明更新弱。
+- `completion_mask.sum()` 是否很小。
+- `beta * per_token_kl` 是否压过 policy reward 项。
+- `old_per_token_logps` 是否和当前 `per_token_logps` 计算口径一致。
+
+### 5.7 Rollout Engine：训练和生成之间的接口
+
+RL 阶段最容易乱的地方，是“谁负责生成”。你的代码用 `rollout_engine.py` 抽象出来。
+
+#### 5.7.1 `compute_per_token_logps()`
+
+输入：
+
+```text
+model
+input_ids: [B, T]
+n_keep: 只保留最后多少个 token
+```
+
+核心：
+
+```python
+logits = model(input_ids, logits_to_keep=n_keep + 1).logits[:, :-1, :]
+ids_row = input_ids[:, -n_keep:]
+gather(log_softmax(logits), ids_row)
+```
+
+为什么只保留最后 `n_keep` 个？因为 RL loss 只优化 completion，不优化 prompt。
+
+输出：
+
+```text
+per_token_logps: [B, n_keep]
+```
+
+#### 5.7.2 `TorchRolloutEngine.rollout()`
+
+核心：
+
+```python
+output_ids = model.generate(
+    input_ids=prompt_ids,
+    attention_mask=attention_mask,
+    max_new_tokens=max_new_tokens,
+    do_sample=True,
+    temperature=temperature,
+    num_return_sequences=num_generations,
+)
+completion_ids = output_ids[:, prompt_len:]
+per_token_logps = compute_per_token_logps(model, output_ids, completion_len)
+completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+```
+
+它完全在 PyTorch 进程里生成，简单可靠，但大规模 rollout 速度可能慢。
+
+#### 5.7.3 `SGLangRolloutEngine.rollout()`
+
+SGLang 分支会把 prompt ids 转成 list，通过 HTTP 请求：
+
+```python
+POST /generate
+payload = {
+    "input_ids": all_input_ids,
+    "sampling_params": {...},
+    "return_logprob": True,
+}
+```
+
+返回里取：
+
+```text
+meta_info.output_ids
+meta_info.output_token_logprobs
+```
+
+再 pad 成 tensor：
+
+```text
+output_ids
+completion_ids
+per_token_logps
+```
+
+这让 rollout 可以交给推理服务做。
+
+#### 5.7.4 `SGLangRolloutEngine.update_policy()`
+
+核心流程：
+
+```python
+unwrapped = model.module if DDP else model
+state_dict = {k: v.detach().half().cpu() for k, v in unwrapped.state_dict().items()}
+unwrapped.save_pretrained(abs_path, state_dict=state_dict, safe_serialization=False)
+tokenizer.save_pretrained(abs_path)
+POST /update_weights_from_disk {"model_path": abs_path}
+```
+
+作用：训练进程更新了 policy 后，把新权重同步给 SGLang 服务。
+
+### 5.8 Distillation：teacher soft label 的 KL
+
+蒸馏代码在 `trainer/train_distillation.py`。
+
+#### 5.8.1 `distillation_loss()`
+
+```python
+teacher_probs = softmax(teacher_logits / temperature)
+student_log_probs = log_softmax(student_logits / temperature)
+kl = F.kl_div(student_log_probs, teacher_probs)
+return temperature ** 2 * kl
+```
+
+解释：
+
+- teacher logits 先除以 temperature，分布更软。
+- student 学的不只是正确 token，也学 teacher 对其他 token 的概率判断。
+- 乘 `temperature ** 2` 是蒸馏常见缩放，保持梯度量级。
+
+#### 5.8.2 蒸馏训练 loss
+
+```python
+ce_loss = cross_entropy(student_logits, labels, ignore_index=-100)
+distill_loss = distillation_loss(student_logits[mask], teacher_logits[mask])
+loss = alpha * ce_loss + (1 - alpha) * distill_loss
+```
+
+这里 mask 来自 SFT labels，主要优化 assistant 区间。
+
+### 5.9 Agent RL：工具调用闭环
+
+Agent 代码在 `trainer/train_agent.py`。
+
+#### 5.9.1 `parse_tool_calls()`
+
+```python
+for m in re.findall(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL):
+    calls.append(json.loads(m.strip()))
+```
+
+它从模型输出中解析工具调用 JSON。
+
+#### 5.9.2 `execute_tool()`
+
+```python
+fn = MOCK_RESULTS.get(name)
+return fn(args)
+```
+
+它根据工具名执行模拟工具，比如计算、天气、时间、汇率、翻译。
+
+代码设置了 alarm timeout，避免工具执行卡住。
+
+#### 5.9.3 `rollout_single()`
+
+这是 Agent multi-turn 的核心。
+
+每一轮：
+
+1. 用 chat template 渲染 messages 和 tools。
+2. rollout 生成 assistant 输出。
+3. 解析 `<tool_call>`。
+4. 如果没有工具调用，结束。
+5. 如果有工具调用，执行工具。
+6. 把 `<tool_response>` 追加到 messages。
+7. 继续下一轮生成。
+
+同时它会记录：
+
+```text
+prompt_ids
+response_ids
+response_mask
+response_old_logps
+turn_outputs
+unfinished
+```
+
+其中 `response_mask=0` 的工具观察 token 不作为 policy 直接优化目标。
+
+#### 5.9.4 Agent `calculate_rewards()`
+
+如果没有工具调用：
+
+- 长度奖励。
+- thinking 奖励。
+- reward model 分数。
+- 重复惩罚。
+
+如果有工具调用：
+
+- tool_call 标签不匹配扣分。
+- 工具名必须在合法工具列表。
+- 参数必须通过 `CHECK_ARGS`。
+- 工具调用数量要接近 gt 数量。
+- 最终答案命中 gt 加分。
+- 多轮未完成扣分。
+
+这说明 Agent RL 优化的不只是回答质量，还包括“会不会正确调用工具”。
+
+### 5.10 每个训练方法的代码阅读顺序
+
+建议你以后按这个顺序读代码：
+
+| 方法 | 阅读顺序 |
+| --- | --- |
+| Pretrain | `PretrainDataset` -> `train_pretrain.py::train_epoch` -> `MiniMindForCausalLM.forward` |
+| Full SFT | `SFTDataset.generate_labels` -> `train_full_sft.py::train_epoch` |
+| LoRA | `LoRA` -> `apply_lora` -> 冻结参数逻辑 -> `save_lora/merge_lora` |
+| DPO | `DPODataset` -> `logits_to_log_probs` -> `dpo_loss` -> `train_epoch` |
+| PPO | `RLAIFDataset` -> `rollout_engine` -> `calculate_rewards` -> `ppo_train_epoch` |
+| GRPO | `RLAIFDataset` -> `rollout_engine` -> `calculate_rewards` -> `grpo_train_epoch` |
+| Distillation | `SFTDataset` -> `distillation_loss` -> student/teacher forward |
+| Agent RL | tools schema -> `rollout_single` -> `execute_tool` -> Agent `calculate_rewards` |
 
 PPO/GRPO/Agent RL 都可以复用这个接口。
 
