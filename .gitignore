@@ -44,6 +44,7 @@ data/cleaned/
 data/sft/
 data/preference/
 data/eval/
+data/rl/
 *.jsonl.gz
 *.parquet
 *.arrow
@@ -60,6 +61,7 @@ wandb/
 logs/
 tensorboard/
 results/
+eval_results/
 swanlog/
 .swanlab/
 
