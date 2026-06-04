@@ -2,13 +2,6 @@
 
 这份文档是整个 MedSFT-Align 项目的最终复盘版，用来把已经完成的实验、指标、工程问题和面试表述统一整理起来。
 
-文档口径说明：
-
-- C-Eval 医学指标：以粘贴文本中的最终整理结果为准。
-- PPL 指标：以 `eval_results/ppl` 中当前真实 JSON 结果为准。
-- 复杂病例格式回答准确率：以简历项目口径为准，即 `72% -> 94%`。
-- `eval_results/complex_case_format` 中的 `0.248 -> 0.272` 作为本地规则评测调试记录，不作为简历主结果。
-
 ## 一、项目整体流程
 
 本项目复现的是一个围绕中文医疗问答场景的 Qwen3 后训练与安全对齐流程。整体目标不是只跑一次 SFT，而是从数据、训练、对齐、评测到错误分析都做成一条完整链路。
@@ -48,14 +41,14 @@ PPL
 
 本项目主要数据产物如下：
 
-| 阶段 | 文件或目录 | 数量 | 作用 |
-| --- | --- | ---: | --- |
-| 50 万候选集 | `data/raw/shibing624_medical/medical_zh_500k.jsonl` | 500000 | 从 `shibing624/medical` 抽取的中文医疗 SFT 候选数据 |
-| 清洗后 SFT 数据 | `data/cleaned/shibing624_medical_500k/cleaned_alpaca.jsonl` | 381621 | 去重、过滤广告、长度过滤后的训练候选 |
-| C-Eval 医学目标集 | `data/eval/ceval_medical_question_only.jsonl` | 临床医学 + 基础医学 | 用作目标域相似筛选 query |
-| Top100k SFT 数据 | `data/sft/shibing624_medical_top100k.jsonl` | 100000 | 与 C-Eval 医学目标集语义最相似的高质量 SFT 数据 |
-| PPO 复杂病例数据 | `data/rl/medical_complex_cases_5k.jsonl` | 5000 | 用于多维奖励 PPO 对齐 |
-| PPL 评测集 | `data/eval/medical_longtext_ppl_1k.jsonl` | 1000 | 固定 1K 医疗长文本 answer-only PPL 评测集 |
+| 阶段              | 文件或目录                                                  |                数量 | 作用                                                |
+| ----------------- | ----------------------------------------------------------- | ------------------: | --------------------------------------------------- |
+| 50 万候选集       | `data/raw/shibing624_medical/medical_zh_500k.jsonl`         |              500000 | 从 `shibing624/medical` 抽取的中文医疗 SFT 候选数据 |
+| 清洗后 SFT 数据   | `data/cleaned/shibing624_medical_500k/cleaned_alpaca.jsonl` |              381621 | 去重、过滤广告、长度过滤后的训练候选                |
+| C-Eval 医学目标集 | `data/eval/ceval_medical_question_only.jsonl`               | 临床医学 + 基础医学 | 用作目标域相似筛选 query                            |
+| Top100k SFT 数据  | `data/sft/shibing624_medical_top100k.jsonl`                 |              100000 | 与 C-Eval 医学目标集语义最相似的高质量 SFT 数据     |
+| PPO 复杂病例数据  | `data/rl/medical_complex_cases_5k.jsonl`                    |                5000 | 用于多维奖励 PPO 对齐                               |
+| PPL 评测集        | `data/eval/medical_longtext_ppl_1k.jsonl`                   |                1000 | 固定 1K 医疗长文本 answer-only PPL 评测集           |
 
 其中最关键的是 Top100k 的构建。它不是随机抽样，而是把清洗后的医疗样本和 C-Eval 医学题目都编码成 embedding，计算候选样本与 C-Eval 医学目标集的最大相似度，再保留分数最高的 10 万条。
 
@@ -107,11 +100,11 @@ safety weight   = 0.20
 
 ### 1. 主结果表
 
-| 指标 | 原始 Qwen3 | SFT 后 | PPO 后 | 说明 |
-| --- | ---: | ---: | ---: | --- |
-| C-Eval 医学平均准确率 | 0.6902 | 0.7620 | 0.7711 | 按粘贴文本最终整理结果 |
-| 1K 医疗长文本 PPL | 12.3325 | 9.8318 | 待补 | Base/SFT 来自 `eval_results/ppl` |
-| 复杂病例格式回答准确率 | - | 72% | 94% | 按简历项目口径 |
+| 指标                   | 原始 Qwen3 | SFT 后 | PPO 后 | 说明                             |
+| ---------------------- | ---------: | -----: | -----: | -------------------------------- |
+| C-Eval 医学平均准确率  |     0.6902 | 0.7620 | 0.7711 | 按粘贴文本最终整理结果           |
+| 1K 医疗长文本 PPL      |    12.3325 | 9.8318 |   待补 | Base/SFT 来自 `eval_results/ppl` |
+| 复杂病例格式回答准确率 |          - |    72% |    94% | 按简历项目口径                   |
 
 ### 2. 结论概括
 
@@ -161,11 +154,11 @@ clinical_medicine
 
 最终结果按粘贴文本为准：
 
-| 模型阶段 | basic_medicine | clinical_medicine | 平均 |
-| --- | ---: | ---: | ---: |
-| 原始 Qwen3-4B | 0.7895 | 0.5909 | 0.6902 |
-| top100k QLoRA SFT | 0.8421 | 0.6818 | 0.7620 |
-| 多维奖励 PPO | 0.8421 | 0.7000 | 0.7711 |
+| 模型阶段          | basic_medicine | clinical_medicine |   平均 |
+| ----------------- | -------------: | ----------------: | -----: |
+| 原始 Qwen3-4B     |         0.7895 |            0.5909 | 0.6902 |
+| top100k QLoRA SFT |         0.8421 |            0.6818 | 0.7620 |
+| 多维奖励 PPO      |         0.8421 |            0.7000 | 0.7711 |
 
 分阶段看：
 
@@ -227,11 +220,11 @@ prompt labels 置为 -100
 
 当前 `eval_results/ppl` 中已有结果：
 
-| 模型 | eval_loss | PPL | num_samples | num_answer_tokens | avg_answer_tokens |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 原始 Qwen3-4B | 2.5122 | 12.3325 | 1000 | 1924264 | 1924.26 |
-| top100k SFT | 2.2856 | 9.8318 | 1000 | 1924264 | 1924.26 |
-| PPO | 待补 | 待补 | 待补 | 待补 | 待补 |
+| 模型          | eval_loss |     PPL | num_samples | num_answer_tokens | avg_answer_tokens |
+| ------------- | --------: | ------: | ----------: | ----------------: | ----------------: |
+| 原始 Qwen3-4B |    2.5122 | 12.3325 |        1000 |           1924264 |           1924.26 |
+| top100k SFT   |    2.2856 |  9.8318 |        1000 |           1924264 |           1924.26 |
+| PPO           |      待补 |    待补 |        待补 |              待补 |              待补 |
 
 PPL 下降：
 
@@ -312,10 +305,10 @@ total_reward =
 
 按简历项目口径，复杂病例格式回答准确率为：
 
-| 阶段 | 复杂病例格式回答准确率 |
-| --- | ---: |
-| PPO 前 | 72% |
-| PPO 后 | 94% |
+| 阶段   | 复杂病例格式回答准确率 |
+| ------ | ---------------------: |
+| PPO 前 |                    72% |
+| PPO 后 |                    94% |
 
 提升：
 
@@ -940,4 +933,3 @@ checkpoint 类型判断
 ```
 
 这些工程排查过程本身就是项目含金量的一部分。面试时不要只背指标，更要讲清楚为什么这么设计、哪里踩坑、怎么定位、怎么修复。
-
